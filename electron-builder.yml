@@ -41,14 +41,6 @@ dmg:
   icon: build/icon.png
   artifactName: Pinchr-${version}-${arch}.dmg
 afterSign: build/notarize.js
-win:
-  executableName: pinchr
-linux:
-  target:
-    - AppImage
-    - deb
-  maintainer: Pinchr
-  category: Utility
 publish:
   provider: generic
   url: https://pinchr-releases.s3.us-east-1.amazonaws.com/

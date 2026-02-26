@@ -6,14 +6,11 @@ import { CommandPalette } from './components/CommandPalette'
 import { KeyboardShortcuts } from './components/KeyboardShortcuts'
 import { VersionBadge } from './components/VersionBadge'
 import { HelpMenu } from './components/HelpMenu'
-import { TrialBanner } from './components/TrialBanner'
-import { Paywall } from './components/Paywall'
 import { ErrorBoundary } from './components/ErrorBoundary'
 import { GlobalErrorHandler } from './components/GlobalErrorHandler'
 import { ReportIssue } from './components/ReportIssue'
 import { TosAcceptance, checkTosAcceptance } from './components/TosAcceptance'
 import { useKeyboardShortcuts } from './hooks/useKeyboardShortcuts'
-import { useLicense } from './hooks/useLicense'
 import { telemetry } from './services/telemetry'
 import type { Page } from '@/types/navigation'
 import Dashboard from './pages/Dashboard'
@@ -182,7 +179,6 @@ class AppErrorBoundary extends React.Component<
 }
 
 export default function App() {
-  const { trialDaysLeft, isTrialExpired, tier, isVerifying, activateLicense, openUpgrade } = useLicense()
   const initialHash = hashPath(window.location.hash).toLowerCase()
   const [currentPage, setCurrentPage] = useState<Page>(() => pageFromHash(initialHash) ?? 'dashboard')
   const [onboardingCompleted, setOnboardingCompleted] = useState<boolean | null>(null)
@@ -191,12 +187,6 @@ export default function App() {
   const [isKeyboardShortcutsOpen, setIsKeyboardShortcutsOpen] = useState(false)
   const [isReportIssueOpen, setIsReportIssueOpen] = useState(false)
   const PageComponent = pages[currentPage]
-  const isPaidTier = tier === 'pinchr' || tier === 'pro'
-  // TODO: Re-enable when payment system is live
-  const hasLicenseAccess = true // isPaidTier || !isTrialExpired
-  const waitingOnLicenseCheck = isVerifying && isTrialExpired && !isPaidTier
-  const trialDaysExpired = Math.max(0, Math.abs(Math.min(0, trialDaysLeft)))
-  const showTrialBanner = false
 
   // Sync app state from URL hash changes.
   useEffect(() => {
@@ -312,17 +302,6 @@ export default function App() {
     )
   }
 
-  if (!hasLicenseAccess) {
-    return (
-      <Paywall
-        trialDaysExpired={trialDaysExpired}
-        isVerifying={isVerifying}
-        onActivateLicense={activateLicense}
-        onOpenUpgrade={openUpgrade}
-      />
-    )
-  }
-
   if (!onboardingCompleted || currentPage === 'onboarding') {
     return (
       <>
@@ -363,9 +342,6 @@ export default function App() {
               <kbd className="rounded bg-surface-3 px-2 py-0.5 text-[10px] text-text-muted">⌘K</kbd>
             </button>
             <div className="ml-auto flex items-center gap-2" style={{ WebkitAppRegion: 'no-drag' } as React.CSSProperties}>
-              {showTrialBanner && (
-                <TrialBanner daysLeft={Math.max(0, trialDaysLeft)} onUpgrade={openUpgrade} />
-              )}
               <VersionBadge mode="inline" />
               <HelpMenu onNavigate={handleNavigate} />
             </div>

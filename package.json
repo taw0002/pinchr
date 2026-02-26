@@ -2,6 +2,12 @@
   "name": "pinchr",
   "version": "1.0.0",
   "description": "Pinchr — Mission Control for AI Assistants",
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/taw0002/pinchr"
+  },
+  "homepage": "https://pinchr.app",
   "main": "./out/main/index.js",
   "scripts": {
     "start": "electron-vite dev",

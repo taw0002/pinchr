@@ -24,10 +24,6 @@ import {
   DialogTitle,
   DialogTrigger,
 } from '@/components/ui/dialog'
-import { ProBadge } from '@/components/ProBadge'
-import { UpgradeModal } from '@/components/UpgradeModal'
-import { useLicense } from '@/hooks/useLicense'
-
 interface QuickAction {
   id: string
   emoji: string
@@ -67,12 +63,10 @@ interface QuickActionsProps {
 }
 
 export default function QuickActions({ onActionClick }: QuickActionsProps) {
-  const { isProFeature } = useLicense()
   const [actions, setActions] = useState<QuickAction[]>(defaultActions)
   const [isEditMode, setIsEditMode] = useState(false)
   const [editingAction, setEditingAction] = useState<QuickAction | null>(null)
   const [isDialogOpen, setIsDialogOpen] = useState(false)
-  const [showUpgradeModal, setShowUpgradeModal] = useState(false)
 
   // Load actions from config on mount
   useEffect(() => {
@@ -234,11 +228,7 @@ export default function QuickActions({ onActionClick }: QuickActionsProps) {
             <div className="flex items-center gap-1">
               <Button
                 onClick={() => {
-                  if (isProFeature('custom-quick-actions')) {
-                    setIsEditMode(true)
-                  } else {
-                    setShowUpgradeModal(true)
-                  }
+                  setIsEditMode(true)
                 }}
                 variant="ghost"
                 size="sm"
@@ -247,7 +237,6 @@ export default function QuickActions({ onActionClick }: QuickActionsProps) {
               >
                 <Settings className="h-4 w-4" />
               </Button>
-              <ProBadge feature="custom-quick-actions" variant="subtle" />
             </div>
           )}
         </div>
@@ -318,11 +307,6 @@ export default function QuickActions({ onActionClick }: QuickActionsProps) {
         </DialogContent>
       </Dialog>
 
-      {/* Upgrade Modal */}
-      <UpgradeModal
-        isOpen={showUpgradeModal}
-        onClose={() => setShowUpgradeModal(false)}
-      />
     </div>
   )
 }

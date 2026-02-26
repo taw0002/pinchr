@@ -540,9 +540,7 @@ export interface User {
   email: string
   name: string
   avatarUrl?: string | null
-  tier: 'free' | 'basic' | 'pro'
-  trialEndsAt?: string | null
-  stripeCustomerId?: string | null
+  tier: 'free'
 }
 
 export interface ElectronAPI {
@@ -676,8 +674,8 @@ export interface ElectronAPI {
     onNavigate: (callback: (route: string) => void) => () => void
   }
   license: {
-    status: () => Promise<IpcResult<{ valid: boolean; plan: 'free' | 'basic' | 'pro'; expiresAt?: string; trialEndsAt?: string; isTrialActive?: boolean }>>
-    activate: (key: string) => Promise<IpcResult<{ valid: boolean; plan: 'free' | 'basic' | 'pro' }>>
+    status: () => Promise<IpcResult<{ valid: boolean; plan: 'free' }>>
+    activate: (key: string) => Promise<IpcResult<{ valid: boolean; plan: 'free' }>>
     deactivate: () => Promise<IpcResult<void>>
   }
   security: {
