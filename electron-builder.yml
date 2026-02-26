@@ -1,0 +1,54 @@
+appId: com.pinchr.app
+productName: Pinchr
+directories:
+  buildResources: build
+  output: dist
+files:
+  - '!**/.vscode/*'
+  - '!src/*'
+  - '!electron.vite.config.*'
+  - '!{tsconfig.json,tsconfig.node.json,tsconfig.web.json}'
+asarUnpack:
+  - node_modules/**/*
+extraResources:
+  - from: resources/default-workspace
+    to: default-workspace
+    filter:
+      - '**/*'
+  - from: resources/node/node
+    to: node/node
+  - from: resources/peekaboo/peekaboo
+    to: peekaboo/peekaboo
+protocols:
+  - name: Pinchr
+    schemes:
+      - pinchr
+mac:
+  identity: "LaunchPad, LLC (8RZNRHSN39)"
+  entitlements: build/entitlements.mac.plist
+  entitlementsInherit: build/entitlements.mac.plist
+  notarize: false
+  gatekeeperAssess: false
+  # Real notarization happens via afterSign: build/notarize.js (uses APPLE_ID env vars)
+  hardenedRuntime: true
+  target:
+    - dmg
+    - zip
+  category: public.app-category.productivity
+  icon: build/icon.png
+dmg:
+  title: Pinchr
+  icon: build/icon.png
+  artifactName: Pinchr-${version}-${arch}.dmg
+afterSign: build/notarize.js
+win:
+  executableName: pinchr
+linux:
+  target:
+    - AppImage
+    - deb
+  maintainer: Pinchr
+  category: Utility
+publish:
+  provider: generic
+  url: https://pinchr-releases.s3.us-east-1.amazonaws.com/
