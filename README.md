@@ -2,7 +2,9 @@
 
 **The AI desktop app powered by [OpenClaw](https://github.com/openclaw/openclaw).**
 
-![Pinchr](docs/screenshot.png)
+<p align="center">
+  <img src="build/icon.png" alt="Pinchr" width="128" />
+</p>
 
 Pinchr is an Electron-based desktop application that puts an AI agent at your fingertips — one that can see your screen, run commands, manage files, browse the web, and integrate with your tools.
 
