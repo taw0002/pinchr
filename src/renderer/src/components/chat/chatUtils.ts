@@ -656,7 +656,7 @@ export function detectChannelBadge(message: DisplayMessage): ChannelBadge | null
   }
 
   // Parse channel from OpenClaw system message patterns
-  // e.g., "Slack DM from Drew Wagner: ...", "WhatsApp message from ...", "Signal DM from ..."
+  // e.g., "Slack DM from John Smith: ...", "WhatsApp message from ...", "Signal DM from ..."
   const systemChannelMatch = content.match(/\b(Slack|WhatsApp|Telegram|Discord|Signal|iMessage)\b/i)
   if (systemChannelMatch) {
     const channel = systemChannelMatch[1].toLowerCase()

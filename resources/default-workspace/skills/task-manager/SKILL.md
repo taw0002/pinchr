@@ -112,7 +112,7 @@ Completion summary should include:
 If blocked:
 - Move task to `blocked`.
 - Add a **clear blocker note** in `description` starting with `BLOCKED:`.
-- Tag the human explicitly in your next message (e.g., "Need Drew decision on …").
+- Tag the human explicitly in your next message (e.g., "Need human decision on …").
 - Immediately select the next best task by priority and proceed.
 
 Blocked task checklist:
@@ -183,7 +183,7 @@ Context from conversation, links, references. Anything a sub-agent would need to
 
 ### When a task comes from conversation:
 - Extract the key requirements and decisions discussed — don't just summarize, capture specifics
-- Include exact quotes or decisions where they matter ("Drew said X should work like Y")
+- Include exact quotes or decisions where they matter ("The user said X should work like Y")
 - Note any rejected alternatives so future-you doesn't re-propose them
 - If the conversation was vague, fill in what you can and mark the rest with `TODO: need clarification`
 

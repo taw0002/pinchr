@@ -39,7 +39,7 @@ Daily entry format (suggested):
 Example:
 ```md
 - 11:30 — Decided to use feature branches only; never commit to main/dev.
-- 11:45 — Blocker: need Drew to confirm pricing tiers.
+- 11:45 — Blocker: need the user to confirm pricing tiers.
 - 12:10 — Wrote skill docs in two locations for Pinchr desktop.
 ```
 

@@ -70,7 +70,7 @@ Tasks snapshot
 - Blocked: <task-id> <blocker>
 
 Blockers / Decisions needed
-- <decision> (owner: Drew) — <what you recommend>
+- <decision> (owner: user) — <what you recommend>
 ```
 
 ## After the brief (keep it lightweight)
