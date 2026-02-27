@@ -34,6 +34,7 @@ let tray: Tray | null = null
 let quickMessageWindow: BrowserWindow | null = null
 let workspaceFileWatcher: WorkspaceFileWatcher | null = null
 const mcpManager = new MCPManager()
+let isQuitting = false
 
 function saveWindowState(window: BrowserWindow): void {
   try {
@@ -313,7 +314,7 @@ function createWindow(): BrowserWindow {
 
   // Handle close to hide to tray instead of quit
   newWindow.on('close', (event) => {
-    if (!app.isQuitting) {
+    if (!isQuitting) {
       event.preventDefault()
       hideMainWindow()
       return false
@@ -475,7 +476,7 @@ app.whenReady().then(() => {
   })
 
   app.on('before-quit', async () => {
-    app.isQuitting = true
+    isQuitting = true
     if (mainWindow && !mainWindow.isDestroyed()) {
       saveWindowState(mainWindow)
     }

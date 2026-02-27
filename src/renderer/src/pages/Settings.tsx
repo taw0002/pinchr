@@ -69,6 +69,20 @@ type AppUpdateStatus = {
   canDownload?: boolean
 }
 
+type LegacyOpenclawHomes = {
+  managedHome: string
+  homes: string[]
+}
+
+type LegacyOpenclawCleanupResult = {
+  managedHome: string
+  archived: Array<{ source: string; archive: string }>
+  removed: string[]
+  skipped: Array<{ home: string; reason: string }>
+  repairOk: boolean
+  repairOutput: string
+}
+
 type ChannelRoutingMetricsSnapshot = {
   enabled: boolean
   metrics: {
@@ -791,6 +805,20 @@ export default function Settings({ onNavigate }: { onNavigate?: (page: Page) => 
     refetchInterval: 10000 // Refresh every 10s
   })
 
+  const {
+    data: legacyHomesData,
+    isLoading: legacyHomesLoading,
+    error: legacyHomesError
+  } = useQuery({
+    queryKey: ['gateway-legacy-homes'],
+    queryFn: async () => {
+      const result = await window.api.gateway.getLegacyHomes()
+      if (!result.ok) throw new Error(result.error || 'Failed to load legacy OpenClaw homes.')
+      return result.data as LegacyOpenclawHomes
+    },
+    refetchInterval: 30_000
+  })
+
   const { data: channelRoutingSettings, isLoading: channelRoutingLoading } = useQuery({
     queryKey: ['channel-routing-settings'],
     queryFn: async () => {
@@ -885,11 +913,23 @@ export default function Settings({ onNavigate }: { onNavigate?: (page: Page) => 
   const updatePollAttemptsRef = useRef(0)
   const [restartFeedback, setRestartFeedback] = useState<{ type: 'success' | 'error'; message: string } | null>(null)
   const restartFeedbackTimerRef = useRef<number | null>(null)
+  const [legacyCleanupFeedback, setLegacyCleanupFeedback] = useState<{
+    type: 'success' | 'error' | 'info'
+    message: string
+  } | null>(null)
+  const legacyCleanupFeedbackTimerRef = useRef<number | null>(null)
 
   const clearRestartFeedbackTimer = () => {
     if (restartFeedbackTimerRef.current !== null) {
       window.clearTimeout(restartFeedbackTimerRef.current)
       restartFeedbackTimerRef.current = null
+    }
+  }
+
+  const clearLegacyCleanupFeedbackTimer = () => {
+    if (legacyCleanupFeedbackTimerRef.current !== null) {
+      window.clearTimeout(legacyCleanupFeedbackTimerRef.current)
+      legacyCleanupFeedbackTimerRef.current = null
     }
   }
 
@@ -1008,6 +1048,50 @@ export default function Settings({ onNavigate }: { onNavigate?: (page: Page) => 
     }
   })
 
+  const cleanupLegacyHomes = useMutation({
+    mutationFn: async (homes?: string[]) => {
+      const result = await window.api.gateway.cleanupLegacyHomes(homes)
+      if (!result.ok) throw new Error(result.error || 'Failed to clean legacy OpenClaw homes.')
+      return result.data as LegacyOpenclawCleanupResult
+    },
+    onMutate: () => {
+      clearLegacyCleanupFeedbackTimer()
+      setLegacyCleanupFeedback(null)
+    },
+    onSuccess: (data) => {
+      queryClient.invalidateQueries({ queryKey: ['gateway-legacy-homes'] })
+      queryClient.invalidateQueries({ queryKey: ['gateway', 'health'] })
+      queryClient.invalidateQueries({ queryKey: ['session-status'] })
+
+      const repairSuffix = data.repairOk ? '' : ' Gateway runtime repair reported issues; use Repair if terminal is still unavailable.'
+
+      if (data.removed.length > 0) {
+        setLegacyCleanupFeedback({
+          type: 'success',
+          message: `Archived and removed ${data.removed.length} legacy OpenClaw home${data.removed.length === 1 ? '' : 's'}.${repairSuffix}`
+        })
+      } else if (data.skipped.length > 0) {
+        setLegacyCleanupFeedback({
+          type: 'info',
+          message: `No legacy homes were removed (${data.skipped.length} skipped).${repairSuffix}`
+        })
+      } else {
+        setLegacyCleanupFeedback({
+          type: 'info',
+          message: `No legacy OpenClaw homes required cleanup.${repairSuffix}`
+        })
+      }
+
+      legacyCleanupFeedbackTimerRef.current = window.setTimeout(() => {
+        setLegacyCleanupFeedback(null)
+      }, 8000)
+    },
+    onError: (error) => {
+      const message = error instanceof Error ? error.message : 'Failed to clean legacy homes.'
+      setLegacyCleanupFeedback({ type: 'error', message })
+    }
+  })
+
   const displayOpenclawVersion = runtimeOpenclawVersion
 
   const stopUpdatePolling = () => {
@@ -1054,6 +1138,7 @@ export default function Settings({ onNavigate }: { onNavigate?: (page: Page) => 
     return () => {
       stopUpdatePolling()
       clearRestartFeedbackTimer()
+      clearLegacyCleanupFeedbackTimer()
     }
   }, [])
 
@@ -1147,6 +1232,25 @@ export default function Settings({ onNavigate }: { onNavigate?: (page: Page) => 
     } catch (error) {
       console.error('Failed to save telemetry preference:', error)
     }
+  }
+
+  const legacyHomes = legacyHomesData?.homes ?? []
+
+  const handleCleanupLegacyHomes = () => {
+    if (legacyHomes.length === 0 || cleanupLegacyHomes.isPending) return
+
+    const confirmed = window.confirm(
+      [
+        'Archive and remove old OpenClaw homes?',
+        '',
+        'Pinchr will copy each home to ~/.pinchr/backups/openclaw before removal.',
+        '',
+        ...legacyHomes
+      ].join('\n')
+    )
+
+    if (!confirmed) return
+    cleanupLegacyHomes.mutate(legacyHomes)
   }
 
   const isOnline = !!health
@@ -1303,6 +1407,93 @@ export default function Settings({ onNavigate }: { onNavigate?: (page: Page) => 
                   <p className="text-xs text-text-muted font-mono mt-1">
                     http://127.0.0.1:18789
                   </p>
+                </div>
+
+                <Separator />
+
+                <div className="space-y-3">
+                  <div className="flex items-center justify-between gap-3">
+                    <div>
+                      <p className="text-sm font-medium text-text-primary">OpenClaw Home</p>
+                      <p className="text-xs text-text-muted font-mono mt-1">
+                        {legacyHomesData?.managedHome || '~/.openclaw'}
+                      </p>
+                    </div>
+                    <Badge variant={legacyHomes.length > 0 ? 'warning' : 'success'}>
+                      {legacyHomes.length > 0 ? `${legacyHomes.length} legacy` : 'Managed'}
+                    </Badge>
+                  </div>
+
+                  {legacyHomesLoading ? (
+                    <div className="rounded-lg border border-border/70 bg-surface-2 p-3 flex items-center gap-2 text-xs text-text-muted">
+                      <Loader2 className="h-3.5 w-3.5 animate-spin" />
+                      Checking for legacy OpenClaw installs...
+                    </div>
+                  ) : null}
+
+                  {legacyHomesError ? (
+                    <div className="rounded-lg border border-red-500/20 bg-red-500/10 p-3 text-xs text-red-300">
+                      {legacyHomesError instanceof Error
+                        ? legacyHomesError.message
+                        : 'Failed to detect legacy OpenClaw homes.'}
+                    </div>
+                  ) : null}
+
+                  {!legacyHomesLoading && legacyHomes.length > 0 && (
+                    <div className="rounded-lg border border-amber-500/20 bg-amber-500/10 p-3 space-y-3">
+                      <div className="flex items-start gap-2">
+                        <AlertTriangle className="h-4 w-4 text-amber-400 mt-0.5 shrink-0" />
+                        <div>
+                          <p className="text-sm font-medium text-amber-300">Legacy OpenClaw install detected</p>
+                          <p className="text-xs text-text-muted mt-1">
+                            We can archive these homes and remove them so Pinchr is the only active install.
+                          </p>
+                        </div>
+                      </div>
+                      <div className="space-y-1">
+                        {legacyHomes.map((home) => (
+                          <p key={home} className="text-xs text-text-muted font-mono break-all">
+                            {home}
+                          </p>
+                        ))}
+                      </div>
+                      <Button
+                        variant="destructive"
+                        size="sm"
+                        onClick={handleCleanupLegacyHomes}
+                        disabled={cleanupLegacyHomes.isPending}
+                        className="gap-2"
+                      >
+                        {cleanupLegacyHomes.isPending ? (
+                          <Loader2 className="h-3.5 w-3.5 animate-spin" />
+                        ) : (
+                          <Unplug className="h-3.5 w-3.5" />
+                        )}
+                        Archive and Remove Legacy Homes
+                      </Button>
+                    </div>
+                  )}
+
+                  {!legacyHomesLoading && legacyHomes.length === 0 && !legacyHomesError && (
+                    <div className="rounded-lg border border-accent/20 bg-accent/10 p-3 text-xs text-accent">
+                      No legacy OpenClaw homes detected.
+                    </div>
+                  )}
+
+                  {legacyCleanupFeedback && (
+                    <div
+                      className={cn(
+                        'rounded-lg border p-3 text-xs',
+                        legacyCleanupFeedback.type === 'success'
+                          ? 'border-accent/20 bg-accent/10 text-accent'
+                          : legacyCleanupFeedback.type === 'error'
+                            ? 'border-red-500/20 bg-red-500/10 text-red-300'
+                            : 'border-amber-500/20 bg-amber-500/10 text-amber-300'
+                      )}
+                    >
+                      {legacyCleanupFeedback.message}
+                    </div>
+                  )}
                 </div>
               </CardContent>
             </Card>

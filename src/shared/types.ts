@@ -540,7 +540,9 @@ export interface User {
   email: string
   name: string
   avatarUrl?: string | null
-  tier: 'free'
+  tier: string
+  trialEndsAt?: string | null
+  stripeCustomerId?: string | null
 }
 
 export interface ElectronAPI {
@@ -562,12 +564,23 @@ export interface ElectronAPI {
       key: string,
       message: string | MessageContentPart[],
       workspaceContext?: { name: string; systemPromptAddition: string },
-      sessionUser?: string
+      sessionUser?: string,
+      mainSessionKey?: string
     ) => Promise<IpcResult<string>> // Returns stream ID
     routeMessage: (mainSessionKey: string, message: string, routeContext?: TopicRouteContext) => Promise<IpcResult<string>>
+    getMainSession: () => Promise<IpcResult<string | null>>
     onStreamChunk: (streamId: string, callback: (data: StreamChunk) => void) => () => void // Returns cleanup function
     onStreamError: (streamId: string, callback: (data: any) => void) => () => void // Returns cleanup function
     getConfig: () => Promise<IpcResult<GatewayConfig>>
+    getLegacyHomes: () => Promise<IpcResult<{ managedHome: string; homes: string[] }>>
+    cleanupLegacyHomes: (homes?: string[]) => Promise<IpcResult<{
+      managedHome: string
+      archived: Array<{ source: string; archive: string }>
+      removed: string[]
+      skipped: Array<{ home: string; reason: string }>
+      repairOk: boolean
+      repairOutput: string
+    }>>
     updateConfig: (config: Record<string, unknown>) => Promise<IpcResult<GatewayConfig>>
     restart: () => Promise<IpcResult<string>>
     repairShell: () => Promise<IpcResult<string>>

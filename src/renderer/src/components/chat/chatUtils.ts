@@ -665,7 +665,7 @@ export function detectChannelBadge(message: DisplayMessage): ChannelBadge | null
   }
 
   // Check for session key patterns in metadata
-  const metadata = (message as Record<string, unknown>).metadata as Record<string, unknown> | undefined
+  const metadata = message.metadata
   if (metadata) {
     const inboundContext = metadata.inbound_context as Record<string, unknown> | undefined
     if (inboundContext?.channel) {

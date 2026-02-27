@@ -1,5 +1,7 @@
 import { ipcMain, dialog, webContents, shell, app, type WebContents } from 'electron'
 import {
+  accessSync,
+  cpSync,
   readFileSync,
   writeFileSync,
   chmodSync,
@@ -9,9 +11,11 @@ import {
   copyFileSync,
   unlinkSync,
   statSync,
+  rmSync,
   openSync,
   readSync,
-  closeSync
+  closeSync,
+  constants as fsConstants
 } from 'fs'
 import { basename, dirname, extname, isAbsolute, join } from 'path'
 import { homedir } from 'os'
@@ -121,6 +125,8 @@ const PINCHR_CONFIG_PATH = join(homedir(), '.pinchr', 'config.json')
 const OPENCLAW_CONFIG_PATH = join(OPENCLAW_HOME_PATH, 'openclaw.json')
 const OPENCLAW_MAIN_AGENT_DIR = join(OPENCLAW_HOME_PATH, 'agents', 'main', 'agent')
 const OPENCLAW_AUTH_PROFILES_PATH = join(OPENCLAW_MAIN_AGENT_DIR, 'auth-profiles.json')
+const OPENCLAW_GATEWAY_LAUNCH_AGENT_PATH = join(homedir(), 'Library', 'LaunchAgents', 'ai.openclaw.gateway.plist')
+const OPENCLAW_NODE_LAUNCH_AGENT_PATH = join(homedir(), 'Library', 'LaunchAgents', 'ai.openclaw.node.plist')
 const OPENCLAW_LOGS_PATH = join(homedir(), '.openclaw', 'logs')
 const QUICK_ACTIONS_PATH = join(homedir(), '.pinchr', 'quick-actions.json')
 const TERMINAL_ROWS = 24
@@ -129,6 +135,7 @@ const LOG_TAIL_MAX_BYTES = 400_000
 const OPENCLAW_LOG_FILENAMES = ['gateway.log', 'gateway.err.log', 'node.log', 'node.err.log'] as const
 const BUNDLED_OPENCLAW_ENTRY = 'openclaw/openclaw.mjs'
 const PINCHR_BIN_PATH = join(homedir(), '.pinchr', 'bin')
+const OPENCLAW_SHIM_MARKER = '# pinchr-openclaw-shim'
 const ONBOARDING_PROVIDER_DEFAULT_MODELS: Record<string, string> = {
   anthropic: 'anthropic/claude-sonnet-4-20250514',
   openai: 'openai/gpt-4.1',
@@ -310,6 +317,233 @@ function writeOpenClawConfig(config: Record<string, unknown>): void {
   writeFileSync(OPENCLAW_CONFIG_PATH, JSON.stringify(config, null, 2))
 }
 
+function readGatewayConfigToken(): string | null {
+  const config = readOpenClawConfig()
+  const gateway = isPlainRecord(config.gateway) ? (config.gateway as Record<string, unknown>) : null
+  const auth = gateway && isPlainRecord(gateway.auth) ? (gateway.auth as Record<string, unknown>) : null
+  return readNonEmptyString(auth?.token) ?? null
+}
+
+function readGatewayLaunchAgentToken(): string | null {
+  try {
+    if (!existsSync(OPENCLAW_GATEWAY_LAUNCH_AGENT_PATH)) return null
+    const plist = readFileSync(OPENCLAW_GATEWAY_LAUNCH_AGENT_PATH, 'utf-8')
+    const match = plist.match(
+      /<key>\s*OPENCLAW_GATEWAY_TOKEN\s*<\/key>\s*<string>\s*([^<]+?)\s*<\/string>/i
+    )
+    return readNonEmptyString(match?.[1]) ?? null
+  } catch {
+    return null
+  }
+}
+
+function readLaunchAgentEnvValue(plistPath: string, envKey: string): string | null {
+  try {
+    if (!existsSync(plistPath)) return null
+    const plist = readFileSync(plistPath, 'utf-8')
+    const escapedKey = envKey.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')
+    const pattern = new RegExp(
+      `<key>\\s*${escapedKey}\\s*<\\/key>\\s*<string>\\s*([^<]+?)\\s*<\\/string>`,
+      'i'
+    )
+    const match = plist.match(pattern)
+    return readNonEmptyString(match?.[1]) ?? null
+  } catch {
+    return null
+  }
+}
+
+function discoverLegacyOpenclawHomes(): string[] {
+  const candidates = [
+    readLaunchAgentEnvValue(OPENCLAW_GATEWAY_LAUNCH_AGENT_PATH, 'OPENCLAW_HOME'),
+    readLaunchAgentEnvValue(OPENCLAW_NODE_LAUNCH_AGENT_PATH, 'OPENCLAW_HOME')
+  ]
+    .filter((value): value is string => Boolean(value))
+    .map((value) => value.trim())
+    .filter((value) => value.length > 0 && isAbsolute(value))
+    .filter((value) => value !== OPENCLAW_HOME_PATH)
+
+  return Array.from(new Set(candidates))
+}
+
+function migrateLegacyOpenclawConfigIfNeeded(): { migrated: boolean; sourceHome?: string } {
+  if (existsSync(OPENCLAW_CONFIG_PATH)) return { migrated: false }
+
+  const legacyHomes = discoverLegacyOpenclawHomes()
+  for (const sourceHome of legacyHomes) {
+    const sourceConfigPath = join(sourceHome, 'openclaw.json')
+    if (!existsSync(sourceConfigPath)) continue
+
+    try {
+      if (!existsSync(OPENCLAW_HOME_PATH)) {
+        mkdirSync(OPENCLAW_HOME_PATH, { recursive: true })
+      }
+
+      copyFileSync(sourceConfigPath, OPENCLAW_CONFIG_PATH)
+
+      const sourceAuthProfilesPath = join(sourceHome, 'agents', 'main', 'agent', 'auth-profiles.json')
+      if (existsSync(sourceAuthProfilesPath) && !existsSync(OPENCLAW_AUTH_PROFILES_PATH)) {
+        if (!existsSync(OPENCLAW_MAIN_AGENT_DIR)) {
+          mkdirSync(OPENCLAW_MAIN_AGENT_DIR, { recursive: true })
+        }
+        copyFileSync(sourceAuthProfilesPath, OPENCLAW_AUTH_PROFILES_PATH)
+      }
+
+      return { migrated: true, sourceHome }
+    } catch {
+      // Keep scanning other candidates.
+    }
+  }
+
+  return { migrated: false }
+}
+
+interface LegacyOpenclawCleanupResult {
+  managedHome: string
+  archived: Array<{ source: string; archive: string }>
+  removed: string[]
+  skipped: Array<{ home: string; reason: string }>
+}
+
+function isManagedOpenclawHomePath(pathValue: string): boolean {
+  return pathValue.replace(/\/+$/, '') === OPENCLAW_HOME_PATH.replace(/\/+$/, '')
+}
+
+function isCleanupTargetSafe(pathValue: string): boolean {
+  const normalized = pathValue.replace(/\/+$/, '')
+  const home = homedir().replace(/\/+$/, '')
+  return isAbsolute(normalized) && normalized.startsWith(`${home}/`) && !isManagedOpenclawHomePath(normalized)
+}
+
+function createLegacyOpenclawArchivePath(sourceHome: string): string {
+  const backupRoot = join(homedir(), '.pinchr', 'backups', 'openclaw')
+  if (!existsSync(backupRoot)) {
+    mkdirSync(backupRoot, { recursive: true })
+  }
+
+  const safeBase = basename(sourceHome).replace(/[^a-zA-Z0-9._-]+/g, '-') || 'openclaw-home'
+  const timestamp = new Date().toISOString().replace(/[:.]/g, '-')
+  let archivePath = join(backupRoot, `${safeBase}-${timestamp}`)
+  let suffix = 1
+  while (existsSync(archivePath)) {
+    archivePath = join(backupRoot, `${safeBase}-${timestamp}-${suffix}`)
+    suffix += 1
+  }
+  return archivePath
+}
+
+function cleanupLegacyOpenclawHomes(requestedHomes?: string[]): LegacyOpenclawCleanupResult {
+  const discovered = discoverLegacyOpenclawHomes()
+  const discoveredSet = new Set(discovered)
+
+  const requested = Array.isArray(requestedHomes)
+    ? requestedHomes.map((home) => home.trim()).filter(Boolean)
+    : []
+  const targets = requested.length > 0 ? Array.from(new Set(requested)) : discovered
+
+  const archived: Array<{ source: string; archive: string }> = []
+  const removed: string[] = []
+  const skipped: Array<{ home: string; reason: string }> = []
+
+  for (const home of targets) {
+    if (!discoveredSet.has(home)) {
+      skipped.push({ home, reason: 'not_discovered' })
+      continue
+    }
+
+    if (!isCleanupTargetSafe(home)) {
+      skipped.push({ home, reason: 'unsafe_path' })
+      continue
+    }
+
+    if (!existsSync(home)) {
+      skipped.push({ home, reason: 'path_missing' })
+      continue
+    }
+
+    if (!existsSync(join(home, 'openclaw.json'))) {
+      skipped.push({ home, reason: 'missing_openclaw_config' })
+      continue
+    }
+
+    const archivePath = createLegacyOpenclawArchivePath(home)
+    try {
+      cpSync(home, archivePath, {
+        recursive: true,
+        force: false,
+        errorOnExist: true,
+        preserveTimestamps: true
+      })
+      rmSync(home, { recursive: true, force: true })
+      archived.push({ source: home, archive: archivePath })
+      removed.push(home)
+    } catch (error) {
+      skipped.push({ home, reason: `archive_or_remove_failed: ${String(error)}` })
+      if (existsSync(archivePath)) {
+        try {
+          rmSync(archivePath, { recursive: true, force: true })
+        } catch {
+          // Best-effort rollback cleanup.
+        }
+      }
+    }
+  }
+
+  return {
+    managedHome: OPENCLAW_HOME_PATH,
+    archived,
+    removed,
+    skipped
+  }
+}
+
+function hasGatewayTokenDrift(): boolean {
+  const configToken = readGatewayConfigToken()
+  const launchAgentToken = readGatewayLaunchAgentToken()
+  if (!configToken || !launchAgentToken) return false
+  return configToken !== launchAgentToken
+}
+
+function isGatewayAuthFailure(error: unknown): boolean {
+  const text = String(error ?? '').toLowerCase()
+  return text.includes('token mismatch')
+    || text.includes('unauthorized')
+    || text.includes('401')
+    || text.includes('code=1008')
+}
+
+async function attemptGatewaySelfRepair(triggerError?: unknown): Promise<{
+  attempted: boolean
+  ok: boolean
+  output: string
+}> {
+  const shouldRepair = hasGatewayTokenDrift() || isGatewayAuthFailure(triggerError)
+  if (!shouldRepair) return { attempted: false, ok: false, output: '' }
+
+  const prepared = await prepareGatewayRuntime()
+  return {
+    attempted: true,
+    ok: prepared.ok,
+    output: prepared.output || ''
+  }
+}
+
+async function runGatewayOpWithAutoRepair<T>(operation: () => Promise<T>): Promise<T> {
+  try {
+    return await operation()
+  } catch (error) {
+    const repairResult = await attemptGatewaySelfRepair(error)
+    if (!repairResult.attempted) {
+      throw error
+    }
+    if (!repairResult.ok) {
+      const message = repairResult.output || 'Gateway self-repair failed.'
+      throw new Error(`${String(error)}\n\n${message}`)
+    }
+    return await operation()
+  }
+}
+
 function readAuthProfiles(): Record<string, unknown> {
   try {
     if (!existsSync(OPENCLAW_AUTH_PROFILES_PATH)) {
@@ -379,6 +613,128 @@ function getBundledOpenclawScriptPath(): string | null {
   return bundledOpenclawScriptPath
 }
 
+function buildOpenclawShimScript(bundledScriptPath: string, bundledNode: string | null): string {
+  const nodeResolution = bundledNode
+    ? `OPENCLAW_NODE_BIN="${bundledNode}"`
+    : [
+        'OPENCLAW_NODE_BIN="${OPENCLAW_NODE_BIN:-$(command -v node 2>/dev/null || true)}"',
+        `if [ -z "$OPENCLAW_NODE_BIN" ]; then OPENCLAW_NODE_BIN="${process.execPath}"; fi`
+      ].join('\n')
+
+  return [
+    '#!/bin/sh',
+    OPENCLAW_SHIM_MARKER,
+    'export OPENCLAW_HOME="${OPENCLAW_HOME:-$HOME/.openclaw}"',
+    nodeResolution,
+    'export ELECTRON_RUN_AS_NODE=1',
+    `exec "$OPENCLAW_NODE_BIN" "${bundledScriptPath}" "$@"`
+  ].join('\n')
+}
+
+function isManagedOpenclawShimScript(script: string): boolean {
+  return script.includes(OPENCLAW_SHIM_MARKER)
+    || (
+      script.includes('app.asar.unpacked/node_modules/openclaw/openclaw.mjs')
+      && script.includes('OPENCLAW_HOME')
+      && script.includes('ELECTRON_RUN_AS_NODE=1')
+    )
+}
+
+function writeManagedOpenclawShim(shimPath: string, script: string): boolean {
+  try {
+    const existing = existsSync(shimPath) ? readFileSync(shimPath, 'utf-8') : ''
+    if (existing && existing !== script && !isManagedOpenclawShimScript(existing)) {
+      return false
+    }
+
+    if (existing !== script) {
+      writeFileSync(shimPath, script, 'utf-8')
+    }
+    chmodSync(shimPath, 0o755)
+    return true
+  } catch {
+    return false
+  }
+}
+
+function hasUnmanagedOpenclawOnPath(): boolean {
+  const pathEntries = (process.env.PATH || '')
+    .split(':')
+    .map((entry) => entry.trim())
+    .filter(Boolean)
+
+  for (const dir of pathEntries) {
+    if (!isAbsolute(dir)) continue
+    const candidate = join(dir, 'openclaw')
+    if (!existsSync(candidate)) continue
+
+    try {
+      accessSync(candidate, fsConstants.X_OK)
+    } catch {
+      continue
+    }
+
+    try {
+      const stats = statSync(candidate)
+      if (!stats.isFile() || stats.size > 128 * 1024) {
+        return true
+      }
+      const content = readFileSync(candidate, 'utf-8')
+      if (!isManagedOpenclawShimScript(content)) {
+        return true
+      }
+    } catch {
+      return true
+    }
+  }
+
+  return false
+}
+
+function ensureOpenclawShimOnUserPath(script: string): void {
+  try {
+    if (hasUnmanagedOpenclawOnPath()) {
+      return
+    }
+
+    const home = homedir()
+    const pathEntries = (process.env.PATH || '')
+      .split(':')
+      .map((entry) => entry.trim())
+      .filter(Boolean)
+
+    const preferred = [join(home, '.local', 'bin'), join(home, 'bin')]
+    const candidates = Array.from(new Set([...pathEntries, ...preferred]))
+
+    for (const dir of candidates) {
+      if (!isAbsolute(dir)) continue
+
+      const inHome = dir === home || dir.startsWith(`${home}/`)
+      if (!existsSync(dir)) {
+        if (!inHome) continue
+        try {
+          mkdirSync(dir, { recursive: true })
+        } catch {
+          continue
+        }
+      }
+
+      try {
+        accessSync(dir, fsConstants.W_OK | fsConstants.X_OK)
+      } catch {
+        continue
+      }
+
+      const shimPath = join(dir, 'openclaw')
+      if (writeManagedOpenclawShim(shimPath, script)) {
+        return
+      }
+    }
+  } catch {
+    // Best-effort only.
+  }
+}
+
 function ensureBundledOpenclawShim(): string | null {
   const bundledScriptPath = getBundledOpenclawScriptPath()
   if (!bundledScriptPath) return null
@@ -390,25 +746,10 @@ function ensureBundledOpenclawShim(): string | null {
 
     const shimPath = join(PINCHR_BIN_PATH, 'openclaw')
     const bundledNode = getBundledNodePath()
-    const nodeResolution = bundledNode
-      ? `OPENCLAW_NODE_BIN="${bundledNode}"`
-      : [
-          'OPENCLAW_NODE_BIN="${OPENCLAW_NODE_BIN:-$(command -v node 2>/dev/null || true)}"',
-          `if [ -z "$OPENCLAW_NODE_BIN" ]; then OPENCLAW_NODE_BIN="${process.execPath}"; fi`
-        ].join('\n')
-    const script = [
-      '#!/bin/sh',
-      'export OPENCLAW_HOME="${OPENCLAW_HOME:-$HOME/.openclaw}"',
-      nodeResolution,
-      'export ELECTRON_RUN_AS_NODE=1',
-      `exec "$OPENCLAW_NODE_BIN" "${bundledScriptPath}" "$@"`
-    ].join('\n')
+    const script = buildOpenclawShimScript(bundledScriptPath, bundledNode)
 
-    const existing = existsSync(shimPath) ? readFileSync(shimPath, 'utf-8') : ''
-    if (existing !== script) {
-      writeFileSync(shimPath, script, 'utf-8')
-      chmodSync(shimPath, 0o755)
-    }
+    writeManagedOpenclawShim(shimPath, script)
+    ensureOpenclawShimOnUserPath(script)
 
     return PINCHR_BIN_PATH
   } catch {
@@ -589,15 +930,15 @@ async function sleep(ms: number): Promise<void> {
 function buildGatewayRepairCommand(): string {
   return [
     'command -v openclaw >/dev/null 2>&1 || { echo "openclaw not found in PATH"; exit 127; }',
-    'openclaw setup --local || true',
+    'openclaw setup --local',
     'launchctl bootout gui/$UID/ai.openclaw.node >/dev/null 2>&1 || true',
     'rm -f "$HOME/Library/LaunchAgents/ai.openclaw.node.plist" || true',
     'openclaw gateway uninstall || true',
     'launchctl bootout gui/$UID/ai.openclaw.gateway >/dev/null 2>&1 || true',
     'rm -f "$HOME/Library/LaunchAgents/ai.openclaw.gateway.plist" || true',
-    'openclaw gateway install --force --port 18789 || true',
-    'openclaw gateway start || openclaw gateway restart || true',
-    'openclaw gateway status || true'
+    'openclaw gateway install --force --port 18789',
+    'openclaw gateway start || openclaw gateway restart',
+    'openclaw gateway status'
   ].join('\n')
 }
 
@@ -649,6 +990,13 @@ async function prepareGatewayRuntime(): Promise<{ ok: boolean; output: string }>
     .join('\n\n')
     .trim()
 
+  if (!repairResult.ok && !gatewayReachable) {
+    return {
+      ok: false,
+      output: combined || 'Gateway repair command failed before connectivity checks.'
+    }
+  }
+
   if (!gatewayReachable) {
     return {
       ok: false,
@@ -666,6 +1014,10 @@ async function writeInitialOpenClawConfig(options?: {
   forceLocalGateway?: boolean
 }): Promise<{ ok: boolean; output: string; created: boolean }> {
   const forceLocalGateway = options?.forceLocalGateway === true
+  const migration = migrateLegacyOpenclawConfigIfNeeded()
+  const migrationNote = migration.migrated && migration.sourceHome
+    ? `Migrated existing OpenClaw config from ${migration.sourceHome}.`
+    : ''
 
   if (existsSync(OPENCLAW_CONFIG_PATH)) {
     if (!existsSync(OPENCLAW_MAIN_AGENT_DIR)) {
@@ -675,9 +1027,21 @@ async function writeInitialOpenClawConfig(options?: {
     const merged = mergePinchrDefaults(existingConfig, 'anthropic', { forceLocalGateway })
     if (merged.changed) {
       writeOpenClawConfig(merged.config)
-      return { ok: true, output: 'openclaw.json exists. Appended Pinchr defaults without overwriting user settings.', created: false }
+      return {
+        ok: true,
+        output: [migrationNote, 'openclaw.json exists. Appended Pinchr defaults without overwriting user settings.']
+          .filter(Boolean)
+          .join(' '),
+        created: false
+      }
     }
-    return { ok: true, output: 'openclaw.json already exists. No default changes needed.', created: false }
+    return {
+      ok: true,
+      output: [migrationNote, 'openclaw.json already exists. No default changes needed.']
+        .filter(Boolean)
+        .join(' '),
+      created: false
+    }
   }
 
   if (!existsSync(OPENCLAW_MAIN_AGENT_DIR)) {
@@ -855,10 +1219,8 @@ async function runShellCommand(
       (error, stdout, stderr) => {
         const output = `${stdout || ''}${stderr || ''}`.trim()
         if (error) {
-          const code =
-            typeof (error as NodeJS.ErrnoException).code === 'number'
-              ? (error as NodeJS.ErrnoException).code as number
-              : null
+          const errorCode = (error as NodeJS.ErrnoException).code
+          const code = typeof errorCode === 'number' ? errorCode : null
           resolve({ ok: false, output, code })
           return
         }
@@ -1257,7 +1619,10 @@ async function invokeGatewayTool(
 export function registerIpcHandlers(mcpManager?: MCPManager): void {
   ipcMain.handle('gateway:health', async () => {
     try {
-      return { ok: true, data: await gatewayHealth() }
+      return {
+        ok: true,
+        data: await runGatewayOpWithAutoRepair(() => gatewayHealth())
+      }
     } catch (error) {
       return { ok: false, error: String(error) }
     }
@@ -1265,7 +1630,10 @@ export function registerIpcHandlers(mcpManager?: MCPManager): void {
 
   ipcMain.handle('gateway:sessions', async () => {
     try {
-      return { ok: true, data: await getSessions() }
+      return {
+        ok: true,
+        data: await runGatewayOpWithAutoRepair(() => getSessions())
+      }
     } catch (error) {
       return { ok: false, error: String(error) }
     }
@@ -1273,7 +1641,10 @@ export function registerIpcHandlers(mcpManager?: MCPManager): void {
 
   ipcMain.handle('gateway:agents-list', async () => {
     try {
-      return { ok: true, data: await getAgentsList() }
+      return {
+        ok: true,
+        data: await runGatewayOpWithAutoRepair(() => getAgentsList())
+      }
     } catch (error) {
       return { ok: false, error: String(error) }
     }
@@ -1282,7 +1653,10 @@ export function registerIpcHandlers(mcpManager?: MCPManager): void {
   ipcMain.handle('gateway:session-history', async (_, sessionKey: string, limit?: number) => {
     try {
       const normalizedLimit = Math.min(Math.max(readPositiveInt(limit) ?? 50, 10), 5000)
-      return { ok: true, data: await getSessionHistory(sessionKey, normalizedLimit) }
+      return {
+        ok: true,
+        data: await runGatewayOpWithAutoRepair(() => getSessionHistory(sessionKey, normalizedLimit))
+      }
     } catch (error) {
       return { ok: false, error: String(error) }
     }
@@ -1582,6 +1956,45 @@ export function registerIpcHandlers(mcpManager?: MCPManager): void {
     }
   })
 
+  ipcMain.handle('gateway:legacy-homes', async () => {
+    try {
+      return {
+        ok: true,
+        data: {
+          managedHome: OPENCLAW_HOME_PATH,
+          homes: discoverLegacyOpenclawHomes()
+        }
+      }
+    } catch (error) {
+      return { ok: false, error: String(error) }
+    }
+  })
+
+  ipcMain.handle('gateway:cleanup-legacy-homes', async (_, homes?: string[]) => {
+    try {
+      const cleanup = cleanupLegacyOpenclawHomes(homes)
+      let repairOutput = ''
+      let repairOk = true
+
+      if (cleanup.removed.length > 0) {
+        const prepared = await prepareGatewayRuntime()
+        repairOk = prepared.ok
+        repairOutput = prepared.output || ''
+      }
+
+      return {
+        ok: true,
+        data: {
+          ...cleanup,
+          repairOk,
+          repairOutput
+        }
+      }
+    } catch (error) {
+      return { ok: false, error: String(error) }
+    }
+  })
+
   ipcMain.handle('gateway:update-config', async (_, config: Record<string, unknown>) => {
     try {
       // Transform shorthand keys to proper OpenClaw config paths
@@ -1631,7 +2044,30 @@ export function registerIpcHandlers(mcpManager?: MCPManager): void {
       const data = await restartGateway()
       return { ok: true, data }
     } catch (error) {
-      return { ok: false, error: String(error) }
+      try {
+        const repairResult = await attemptGatewaySelfRepair(error)
+        if (repairResult.attempted && !repairResult.ok) {
+          return {
+            ok: false,
+            error: `${String(error)}\n\n${repairResult.output || 'Gateway self-repair failed.'}`
+          }
+        }
+
+        const shellRestartResult = await runShellCommand('openclaw gateway restart || openclaw gateway start', 60_000)
+        if (shellRestartResult.ok) {
+          return {
+            ok: true,
+            data: shellRestartResult.output || repairResult.output || 'Gateway restarted with shell fallback.'
+          }
+        }
+
+        return {
+          ok: false,
+          error: shellRestartResult.output || String(error)
+        }
+      } catch (fallbackError) {
+        return { ok: false, error: String(fallbackError) }
+      }
     }
   })
 
@@ -1685,7 +2121,14 @@ export function registerIpcHandlers(mcpManager?: MCPManager): void {
     try {
       const result = await runShellCommand('openclaw gateway restart', 60_000)
       if (!result.ok) {
-        return { ok: false, error: result.output || 'Failed to start gateway' }
+        const prepared = await prepareGatewayRuntime()
+        if (!prepared.ok) {
+          return {
+            ok: false,
+            error: `${result.output || 'Failed to start gateway'}\n\n${prepared.output || 'Gateway repair failed.'}`
+          }
+        }
+        return { ok: true, data: prepared.output || result.output }
       }
       return { ok: true, data: result.output }
     } catch (error) {
@@ -1771,7 +2214,9 @@ export function registerIpcHandlers(mcpManager?: MCPManager): void {
             return { ok: false, error: String(error) }
           }
         }
-        const data = await invokeGatewayTool(tool, args ?? {}, sessionKey)
+        const data = await runGatewayOpWithAutoRepair(
+          () => invokeGatewayTool(tool, args ?? {}, sessionKey)
+        )
         return { ok: true, data }
       } catch (error) {
         return { ok: false, error: String(error) }
@@ -1781,7 +2226,9 @@ export function registerIpcHandlers(mcpManager?: MCPManager): void {
 
   ipcMain.handle('gateway:tools-sessions-list', async (_, parameters?: Record<string, unknown>) => {
     try {
-      const data = await invokeGatewayTool('sessions_list', parameters ?? {})
+      const data = await runGatewayOpWithAutoRepair(
+        () => invokeGatewayTool('sessions_list', parameters ?? {})
+      )
       return { ok: true, data }
     } catch (error) {
       return { ok: false, error: String(error) }
@@ -1790,7 +2237,9 @@ export function registerIpcHandlers(mcpManager?: MCPManager): void {
 
   ipcMain.handle('gateway:tools-session-status', async (_, parameters?: Record<string, unknown>) => {
     try {
-      const data = await invokeGatewayTool('session_status', parameters ?? {})
+      const data = await runGatewayOpWithAutoRepair(
+        () => invokeGatewayTool('session_status', parameters ?? {})
+      )
       return { ok: true, data }
     } catch (error) {
       return { ok: false, error: String(error) }

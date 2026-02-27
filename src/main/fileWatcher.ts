@@ -110,7 +110,12 @@ export function startWorkspaceFileWatcher({
 
   try {
     watcher = watch(workspacePath, (_eventType, filename) => {
-      const changedFile = typeof filename === 'string' ? filename : filename?.toString()
+      const changedFile =
+        typeof filename === 'string'
+          ? filename
+          : filename
+            ? String(filename)
+            : undefined
       if (!changedFile) return
       const fileName = basename(changedFile)
       if (!watchedFiles.has(fileName as WatchedFile)) return

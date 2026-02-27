@@ -135,7 +135,7 @@ export const AVAILABLE_MODELS: ModelInfo[] = [
 
 const PROXY_URL =
   (typeof import.meta !== 'undefined' &&
-    (import.meta as Record<string, Record<string, string>>).env?.PINCHR_PROXY_URL) ||
+    (import.meta as ImportMeta & { env?: Record<string, string | undefined> }).env?.PINCHR_PROXY_URL) ||
   'https://proxy.pinchr.app'
 
 // ---------------------------------------------------------------------------

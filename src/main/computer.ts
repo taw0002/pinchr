@@ -254,7 +254,7 @@ export async function checkPermissions(): Promise<ComputerPermissions> {
 
     // Check Screen Recording permission using Electron's native API
     const screenStatus = systemPreferences.getMediaAccessStatus('screen')
-    const nativeScreenRecording = screenStatus === 'granted' || screenStatus === 'limited'
+    const nativeScreenRecording = screenStatus === 'granted'
 
     // Check Accessibility permission using Electron's native API
     const nativeAccessibility = systemPreferences.isTrustedAccessibilityClient(false)

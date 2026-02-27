@@ -283,7 +283,7 @@ export default function App() {
   }, [])
 
   // Show loading state while checking TOS and onboarding
-  if (tosAccepted === null || onboardingCompleted === null || waitingOnLicenseCheck) {
+  if (tosAccepted === null || onboardingCompleted === null) {
     return (
       <div className="flex h-screen items-center justify-center bg-background">
         <VersionBadge />

@@ -564,7 +564,7 @@ export function useSimpleChat(options: UseSimpleChatOptions = {}) {
               } else {
                 nextToolCalls.push({
                   id: createId('tool'),
-                  toolName: chunk.toolName,
+                  toolName: chunk.toolName ?? 'tool',
                   status: 'completed',
                   result: chunk.toolResult,
                   timestamp: new Date().toISOString()

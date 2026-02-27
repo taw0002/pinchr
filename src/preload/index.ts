@@ -98,6 +98,8 @@ const api = {
       return () => streamHandlers.delete(`error-${streamId}`)
     },
     getConfig: () => ipcRenderer.invoke('gateway:config'),
+    getLegacyHomes: () => ipcRenderer.invoke('gateway:legacy-homes'),
+    cleanupLegacyHomes: (homes?: string[]) => ipcRenderer.invoke('gateway:cleanup-legacy-homes', homes),
     updateConfig: (config: Record<string, unknown>) =>
       ipcRenderer.invoke('gateway:update-config', config),
     restart: () => ipcRenderer.invoke('gateway:restart'),

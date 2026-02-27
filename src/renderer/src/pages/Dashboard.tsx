@@ -187,7 +187,8 @@ export default function Dashboard({ onNavigate }: { onNavigate?: (page: Page) =>
     [config]
   )
   const configuredChannelCount = channelHealth.filter((channel) => channel.configured).length
-  const agentLoading = (identityLoading && !identityDoc) || (isOnline && agentsLoading && !(agents?.length ?? 0))
+  const agentCount = Array.isArray(agents) ? agents.length : 0
+  const agentLoading = (identityLoading && !identityDoc) || (isOnline && agentsLoading && agentCount === 0)
 
   useEffect(() => {
     waitingForPermissionGrantRef.current = waitingForPermissionGrant

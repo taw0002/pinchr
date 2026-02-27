@@ -1,4 +1,4 @@
-import { FormEvent, useCallback, useEffect, useMemo, useState } from 'react'
+import { FormEvent, useCallback, useEffect, useMemo, useState, type CSSProperties } from 'react'
 import { AnimatePresence, motion } from 'framer-motion'
 import { AlertCircle, CheckCircle2, Loader2, ShieldCheck, Terminal, FileText, Globe, KeyRound } from 'lucide-react'
 import { Button } from '@/components/ui/button'
@@ -147,7 +147,7 @@ export default function Onboarding() {
 
   return (
     <div className="flex h-screen flex-col bg-[#0a0a0a] text-text-primary">
-      <div className="h-8 w-full flex-shrink-0" style={{ WebkitAppRegion: 'drag' }} />
+      <div className="h-8 w-full flex-shrink-0" style={{ WebkitAppRegion: 'drag' } as CSSProperties} />
 
       <div className="relative h-[3px] w-full flex-shrink-0 bg-surface-2">
         <motion.div

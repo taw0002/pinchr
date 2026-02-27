@@ -8,7 +8,7 @@ import { cn } from '@/lib/utils'
 interface EmbeddedTerminalProps {
   className?: string
   initialCommand?: string
-  onExit?: (data: { exitCode?: number }) => void
+  onExit?: (data: { exitCode: number | null; signal: number | null }) => void
   onError?: (message: string) => void
 }
 

@@ -203,7 +203,7 @@ export function useSessionSearch(
         })
 
         const settled = await Promise.all(promises)
-        return settled.filter((r): r is SessionSearchResult => r !== null)
+        return settled.filter((r): r is NonNullable<typeof r> => r !== null)
       }
 
       // Process in batches of 5 to avoid overwhelming the gateway

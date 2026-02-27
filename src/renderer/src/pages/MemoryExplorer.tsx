@@ -1,6 +1,5 @@
 import { useEffect, useMemo, useRef, useState } from 'react'
 import Editor from '@monaco-editor/react'
-import type { editor as MonacoEditor } from 'monaco-editor'
 import ReactMarkdown from 'react-markdown'
 import {
   Brain,
@@ -36,6 +35,12 @@ import {
 type EditorViewMode = 'edit' | 'preview' | 'split'
 
 type SidebarMode = 'files' | 'timeline'
+
+type EditorHandle = {
+  revealLineInCenter: (lineNumber: number) => void
+  setPosition: (position: { lineNumber: number; column: number }) => void
+  focus: () => void
+}
 
 function formatRelativeAge(value?: string): { days?: number; label: string } {
   if (!value) return { label: 'Unknown' }
@@ -78,7 +83,7 @@ export default function MemoryExplorer() {
   const [lastSavedAt, setLastSavedAt] = useState<string | null>(null)
   const [saveError, setSaveError] = useState<string | null>(null)
   const [jumpTarget, setJumpTarget] = useState<{ path: string; line: number } | null>(null)
-  const editorRef = useRef<MonacoEditor.IStandaloneCodeEditor | null>(null)
+  const editorRef = useRef<EditorHandle | null>(null)
   const selectedFileRef = useRef<string | null>(null)
 
   const memoryCatalogQuery = useMemoryCatalog(memoryFiles)

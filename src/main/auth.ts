@@ -19,6 +19,16 @@ interface AuthSession {
 
 let currentSession: AuthSession | null = null
 
+function asRecord(value: unknown): Record<string, unknown> {
+  return value && typeof value === 'object' ? (value as Record<string, unknown>) : {}
+}
+
+function readString(value: unknown): string | undefined {
+  if (typeof value !== 'string') return undefined
+  const trimmed = value.trim()
+  return trimmed.length > 0 ? trimmed : undefined
+}
+
 /**
  * Parse the pinchr:// protocol callback URL and extract tokens
  */
@@ -109,17 +119,21 @@ export async function fetchUserProfile(accessToken: string): Promise<User> {
     throw new Error(`Failed to fetch user profile: ${response.status} ${response.statusText}`)
   }
 
-  const data = await response.json()
+  const data = asRecord(await response.json())
 
   // Map API response to User type
   const user: User = {
-    id: data.id,
-    email: data.email,
-    name: data.name || data.email,
-    avatarUrl: data.avatar_url || data.avatarUrl,
-    tier: data.tier || 'free',
-    trialEndsAt: data.trial_ends_at || data.trialEndsAt,
-    stripeCustomerId: data.stripe_customer_id || data.stripeCustomerId
+    id: readString(data.id) ?? '',
+    email: readString(data.email) ?? '',
+    name: readString(data.name) ?? readString(data.email) ?? '',
+    avatarUrl: readString(data.avatar_url) ?? readString(data.avatarUrl) ?? null,
+    tier: readString(data.tier) ?? 'free',
+    trialEndsAt: readString(data.trial_ends_at) ?? readString(data.trialEndsAt) ?? null,
+    stripeCustomerId: readString(data.stripe_customer_id) ?? readString(data.stripeCustomerId) ?? null
+  }
+
+  if (!user.id || !user.email) {
+    throw new Error('User profile response missing required fields')
   }
 
   return user
@@ -215,8 +229,8 @@ export async function refreshAccessToken(): Promise<string | null> {
       throw new Error(`Failed to refresh token: ${response.status}`)
     }
 
-    const data = await response.json()
-    const newAccessToken = data.access_token || data.accessToken
+    const data = asRecord(await response.json())
+    const newAccessToken = readString(data.access_token) || readString(data.accessToken)
 
     if (!newAccessToken) {
       throw new Error('No access token in refresh response')
