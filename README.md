@@ -17,7 +17,7 @@ Pinchr is an Electron-based desktop application that puts an AI agent at your fi
 
 ### Download
 
-Grab the latest `.dmg` from [Releases](https://github.com/taw0002/pinchr/releases), open it, and drag Pinchr to Applications.
+[**Download Pinchr**](https://github.com/taw0002/pinchr/releases/download/v1.0.0/Pinchr-1.0.0-arm64.dmg) (macOS Apple Silicon) — open the `.dmg` and drag Pinchr to Applications.
 
 ### Build from Source
 

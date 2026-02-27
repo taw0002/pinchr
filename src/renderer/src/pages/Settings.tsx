@@ -1776,7 +1776,7 @@ export default function Settings({ onNavigate }: { onNavigate?: (page: Page) => 
                     Discord
                   </button>
                   <button
-                    onClick={() => handleOpenLink('https://github.com/pinchr-app/pinchr')}
+                    onClick={() => handleOpenLink('https://github.com/taw0002/pinchr')}
                     className="text-accent hover:underline flex items-center gap-1"
                   >
                     <ExternalLink className="h-3.5 w-3.5" />
