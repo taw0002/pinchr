@@ -6077,10 +6077,10 @@ graceful-fs@^4.1.11, graceful-fs@^4.1.6, graceful-fs@^4.2.0, graceful-fs@^4.2.4,
   resolved "https://registry.npmjs.org/graceful-fs/-/graceful-fs-4.2.11.tgz"
   integrity sha512-RbJ5/jmFcNNCcDV5o9eTnBLJ/HszWV0P73bc+Ff4nS/rJj+YaS6IGyiOL0VoBYX+l1Wrl3k63h/KrH+nhJ0XvQ==
 
-grammy@^1.40.0:
-  version "1.40.0"
-  resolved "https://registry.npmjs.org/grammy/-/grammy-1.40.0.tgz"
-  integrity sha512-ssuE7fc1AwqlUxHr931OCVW3fU+oFDjHZGgvIedPKXfTdjXvzP19xifvVGCnPtYVUig1Kz+gwxe4A9M5WdkT4Q==
+grammy@^1.40.1:
+  version "1.40.1"
+  resolved "https://registry.yarnpkg.com/grammy/-/grammy-1.40.1.tgz#1292262cb9de962157b2db7f264ff60e4898f3bc"
+  integrity sha512-bTe8SWXD8/Sdt2LGAAAsFGhuxI9RG8zL2gGk3V42A/RxriPqBQqwMGoNSldNK1qIFD2EaVuq7NQM8+ZAmNgHLw==
   dependencies:
     "@grammyjs/types" "3.24.0"
     abort-controller "^3.0.0"
@@ -7946,10 +7946,10 @@ openai@6.10.0:
   resolved "https://registry.npmjs.org/openai/-/openai-6.10.0.tgz"
   integrity sha512-ITxOGo7rO3XRMiKA5l7tQ43iNNu+iXGFAcf2t+aWVzzqRaS0i7m1K2BhxNdaveB+5eENhO0VY1FkiZzhBk4v3A==
 
-openclaw@^2026.2.25:
-  version "2026.2.25"
-  resolved "https://registry.yarnpkg.com/openclaw/-/openclaw-2026.2.25.tgz#f335340ad1666cfdb6d50e6ea923d14ba8842a32"
-  integrity sha512-eZmWzDMxiu6Xzcw/a1XEefe7dhUrEOAi5HisyrvBtuzV4RT/zcT330KlAL0t24qYkHMD73QGEhZwTju0bKVzLg==
+openclaw@^2026.2.26:
+  version "2026.2.26"
+  resolved "https://registry.yarnpkg.com/openclaw/-/openclaw-2026.2.26.tgz#cd9b46d9b3a654682904a6d87cc22571637cfac5"
+  integrity sha512-SAGBigUXYNGl+zPZCR3XkdMZ3wNEYsDybxnFcTZS90aE7Ztrb/avXEAzxv1XcR8xqDxIZFVZv+abHDRO+Nv1vA==
   dependencies:
     "@agentclientprotocol/sdk" "0.14.1"
     "@aws-sdk/client-bedrock" "^3.998.0"
@@ -7982,7 +7982,7 @@ openclaw@^2026.2.25:
     dotenv "^17.3.1"
     express "^5.2.1"
     file-type "^21.3.0"
-    grammy "^1.40.0"
+    grammy "^1.40.1"
     https-proxy-agent "^7.0.6"
     ipaddr.js "^2.3.0"
     jiti "^2.6.1"
