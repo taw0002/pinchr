@@ -17,9 +17,9 @@ import {
   closeSync,
   constants as fsConstants
 } from 'fs'
-import { basename, dirname, extname, isAbsolute, join } from 'path'
+import { basename, dirname, extname, isAbsolute, join, relative, resolve, sep } from 'path'
 import { homedir } from 'os'
-import { exec, execSync } from 'child_process'
+import { exec, execFileSync } from 'child_process'
 import { randomUUID } from 'crypto'
 import { createRequire } from 'module'
 import * as pty from 'node-pty'
@@ -1287,6 +1287,30 @@ function sanitizeFilename(value: string): string {
   return base || 'attachment'
 }
 
+function isPathWithinBase(basePath: string, targetPath: string): boolean {
+  const resolvedBase = resolve(basePath)
+  const resolvedTarget = resolve(targetPath)
+  return resolvedTarget === resolvedBase || resolvedTarget.startsWith(`${resolvedBase}${sep}`)
+}
+
+function resolveWorkspacePath(inputPath: string, options?: { allowAbsolute?: boolean }): string | null {
+  const normalized = readNonEmptyString(inputPath)
+  if (!normalized || normalized.includes('\0')) return null
+
+  if (isAbsolute(normalized)) {
+    if (!options?.allowAbsolute) return null
+    const absoluteCandidate = resolve(normalized)
+    return isPathWithinBase(WORKSPACE_PATH, absoluteCandidate) ? absoluteCandidate : null
+  }
+
+  const candidate = resolve(WORKSPACE_PATH, normalized)
+  return isPathWithinBase(WORKSPACE_PATH, candidate) ? candidate : null
+}
+
+function toWorkspaceRelativePath(absolutePath: string): string {
+  return relative(WORKSPACE_PATH, absolutePath).replace(/\\/g, '/')
+}
+
 function inferAttachmentMimeType(sourcePath: string): string {
   const ext = extname(sourcePath).toLowerCase()
   const mimeByExt: Record<string, string> = {
@@ -1346,6 +1370,23 @@ function readNonEmptyString(value: unknown): string | undefined {
   if (typeof value !== 'string') return undefined
   const trimmed = value.trim()
   return trimmed.length > 0 ? trimmed : undefined
+}
+
+const ALLOWED_EXTERNAL_PROTOCOLS = new Set(['https:', 'http:', 'mailto:'])
+
+function sanitizeExternalUrl(value: unknown): string | null {
+  const text = readNonEmptyString(value)
+  if (!text) return null
+
+  try {
+    const parsed = new URL(text)
+    if (!ALLOWED_EXTERNAL_PROTOCOLS.has(parsed.protocol)) {
+      return null
+    }
+    return parsed.toString()
+  } catch {
+    return null
+  }
 }
 
 function normalizeRouteMessageInboundContext(value: unknown): TopicRouteInboundContext | undefined {
@@ -2447,6 +2488,7 @@ export function registerIpcHandlers(mcpManager?: MCPManager): void {
 
   ipcMain.handle('terminal:create', async (event) => {
     try {
+      enforcePermission('command_run', 'Create terminal session')
       const result = createTerminalSession(event.sender)
       if (!result.ok) {
         return { ok: false, error: result.error || 'Failed to create terminal session.' }
@@ -2459,6 +2501,7 @@ export function registerIpcHandlers(mcpManager?: MCPManager): void {
 
   ipcMain.handle('terminal:write', async (event, data: string) => {
     try {
+      enforcePermission('command_run', 'Run terminal command')
       const session = terminalSessions.get(event.sender.id)
       if (!session) {
         return { ok: false, error: 'No active terminal session.' }
@@ -2507,8 +2550,8 @@ export function registerIpcHandlers(mcpManager?: MCPManager): void {
     try {
       enforcePermission('file_read', `Read file: ${filename}`)
       activityLogger.log('file_read', `Read file: ${filename}`)
-      const filepath = join(WORKSPACE_PATH, filename)
-      if (!filepath.startsWith(WORKSPACE_PATH)) {
+      const filepath = resolveWorkspacePath(filename)
+      if (!filepath) {
         return { ok: false, error: 'Invalid file path' }
       }
       const content = readFileSync(filepath, 'utf-8')
@@ -2522,8 +2565,8 @@ export function registerIpcHandlers(mcpManager?: MCPManager): void {
     try {
       enforcePermission('file_read', `Read file: ${filename}`)
       activityLogger.log('file_read', `Read binary file: ${filename}`)
-      const filepath = join(WORKSPACE_PATH, filename)
-      if (!filepath.startsWith(WORKSPACE_PATH)) {
+      const filepath = resolveWorkspacePath(filename)
+      if (!filepath) {
         return { ok: false, error: 'Invalid file path' }
       }
       const buffer = readFileSync(filepath)
@@ -2544,8 +2587,8 @@ export function registerIpcHandlers(mcpManager?: MCPManager): void {
     try {
       enforcePermission('file_write', `Write file: ${filename}`)
       activityLogger.log('file_write', `Write file: ${filename}`)
-      const filepath = join(WORKSPACE_PATH, filename)
-      if (!filepath.startsWith(WORKSPACE_PATH)) {
+      const filepath = resolveWorkspacePath(filename)
+      if (!filepath) {
         return { ok: false, error: 'Invalid file path' }
       }
       const parentDir = dirname(filepath)
@@ -2563,8 +2606,8 @@ export function registerIpcHandlers(mcpManager?: MCPManager): void {
     try {
       enforcePermission('file_write', `Delete file: ${filename}`)
       activityLogger.log('file_write', `Delete file: ${filename}`)
-      const filepath = join(WORKSPACE_PATH, filename)
-      if (!filepath.startsWith(WORKSPACE_PATH)) {
+      const filepath = resolveWorkspacePath(filename)
+      if (!filepath) {
         return { ok: false, error: 'Invalid file path' }
       }
 
@@ -2616,8 +2659,8 @@ export function registerIpcHandlers(mcpManager?: MCPManager): void {
       })
 
       const destinationRelative = safeSegments.join('/')
-      const destinationPath = join(WORKSPACE_PATH, destinationRelative)
-      if (!destinationPath.startsWith(WORKSPACE_PATH)) {
+      const destinationPath = resolveWorkspacePath(destinationRelative)
+      if (!destinationPath) {
         return { ok: false, error: 'Invalid destination path' }
       }
 
@@ -3440,7 +3483,11 @@ export function registerIpcHandlers(mcpManager?: MCPManager): void {
   // Open external links (for markdown links)
   ipcMain.handle('shell:open-external', async (_, url: string) => {
     try {
-      await shell.openExternal(url)
+      const safeUrl = sanitizeExternalUrl(url)
+      if (!safeUrl) {
+        return { ok: false, error: 'Invalid URL' }
+      }
+      await shell.openExternal(safeUrl)
       return { ok: true }
     } catch (error) {
       return { ok: false, error: String(error) }
@@ -3454,8 +3501,8 @@ export function registerIpcHandlers(mcpManager?: MCPManager): void {
         return { ok: false, error: 'Path is required' }
       }
 
-      const resolvedPath = isAbsolute(normalizedPath) ? normalizedPath : join(WORKSPACE_PATH, normalizedPath)
-      if (!isAbsolute(normalizedPath) && !resolvedPath.startsWith(WORKSPACE_PATH)) {
+      const resolvedPath = resolveWorkspacePath(normalizedPath, { allowAbsolute: true })
+      if (!resolvedPath) {
         return { ok: false, error: 'Invalid file path' }
       }
 
@@ -3597,16 +3644,18 @@ export function registerIpcHandlers(mcpManager?: MCPManager): void {
           // Try unstaged first, then HEAD
           let diffStat = ''
           try {
-            diffStat = execSync(
-              `git diff --numstat -- "${filePath}"`,
+            diffStat = execFileSync(
+              'git',
+              ['diff', '--numstat', '--', filePath],
               { cwd: WORKSPACE_PATH, encoding: 'utf-8', timeout: 3000 }
             ).trim()
           } catch { /* ignore */ }
 
           if (!diffStat) {
             try {
-              diffStat = execSync(
-                `git diff HEAD --numstat -- "${filePath}"`,
+              diffStat = execFileSync(
+                'git',
+                ['diff', 'HEAD', '--numstat', '--', filePath],
                 { cwd: WORKSPACE_PATH, encoding: 'utf-8', timeout: 3000 }
               ).trim()
             } catch { /* ignore */ }
@@ -3638,7 +3687,7 @@ export function registerIpcHandlers(mcpManager?: MCPManager): void {
       // Check for deleted files via git
       const deletedFiles = new Set<string>()
       try {
-        const gitStatus = execSync('git status --porcelain', {
+        const gitStatus = execFileSync('git', ['status', '--porcelain'], {
           cwd: WORKSPACE_PATH, encoding: 'utf-8', timeout: 5000
         }).trim()
         if (gitStatus) {
@@ -3649,8 +3698,9 @@ export function registerIpcHandlers(mcpManager?: MCPManager): void {
               // Get last modify time from git log
               let lastModified = new Date().toISOString()
               try {
-                const logDate = execSync(
-                  `git log -1 --format="%ai" -- "${filePath}"`,
+                const logDate = execFileSync(
+                  'git',
+                  ['log', '-1', '--format=%ai', '--', filePath],
                   { cwd: WORKSPACE_PATH, encoding: 'utf-8', timeout: 3000 }
                 ).trim()
                 if (logDate) lastModified = new Date(logDate).toISOString()
@@ -3749,15 +3799,16 @@ export function registerIpcHandlers(mcpManager?: MCPManager): void {
   ipcMain.handle('security:file-diff', async (_, filePath: string) => {
     try {
       // Try git diff (unstaged changes) first, then git diff HEAD (staged + unstaged)
-      const fullPath = join(WORKSPACE_PATH, filePath)
-      if (!fullPath.startsWith(WORKSPACE_PATH)) {
+      const fullPath = resolveWorkspacePath(filePath)
+      if (!fullPath) {
         return { ok: false, error: 'Invalid file path' }
       }
+      const workspaceRelativePath = toWorkspaceRelativePath(fullPath)
 
       let diff = ''
       try {
         // Show unstaged changes
-        diff = execSync(`git diff -- "${filePath}"`, {
+        diff = execFileSync('git', ['diff', '--', workspaceRelativePath], {
           cwd: WORKSPACE_PATH,
           encoding: 'utf-8',
           timeout: 5000
@@ -3767,7 +3818,7 @@ export function registerIpcHandlers(mcpManager?: MCPManager): void {
       // If no unstaged diff, check if file is untracked (new file)
       if (!diff) {
         try {
-          const status = execSync(`git status --porcelain -- "${filePath}"`, {
+          const status = execFileSync('git', ['status', '--porcelain', '--', workspaceRelativePath], {
             cwd: WORKSPACE_PATH,
             encoding: 'utf-8',
             timeout: 5000
@@ -3780,11 +3831,11 @@ export function registerIpcHandlers(mcpManager?: MCPManager): void {
               .split('\n')
               .map((line) => `+ ${line}`)
               .join('\n')
-            diff = `--- /dev/null\n+++ b/${filePath}\n${diff}`
+            diff = `--- /dev/null\n+++ b/${workspaceRelativePath}\n${diff}`
           } else if (status) {
             // Has staged changes
             try {
-              diff = execSync(`git diff HEAD -- "${filePath}"`, {
+              diff = execFileSync('git', ['diff', 'HEAD', '--', workspaceRelativePath], {
                 cwd: WORKSPACE_PATH,
                 encoding: 'utf-8',
                 timeout: 5000
@@ -3797,8 +3848,9 @@ export function registerIpcHandlers(mcpManager?: MCPManager): void {
       // Also get recent git log for the file
       let history: Array<{ hash: string; date: string; message: string }> = []
       try {
-        const log = execSync(
-          `git log --pretty=format:"%h|%ai|%s" -10 -- "${filePath}"`,
+        const log = execFileSync(
+          'git',
+          ['log', '--pretty=format:%h|%ai|%s', '-10', '--', workspaceRelativePath],
           { cwd: WORKSPACE_PATH, encoding: 'utf-8', timeout: 5000 }
         ).trim()
         if (log) {

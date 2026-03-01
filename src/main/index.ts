@@ -36,6 +36,16 @@ let workspaceFileWatcher: WorkspaceFileWatcher | null = null
 const mcpManager = new MCPManager()
 let isQuitting = false
 
+function openExternalIfSafe(rawUrl: string): void {
+  try {
+    const parsed = new URL(rawUrl)
+    if (!['https:', 'http:', 'mailto:'].includes(parsed.protocol)) return
+    void shell.openExternal(parsed.toString())
+  } catch {
+    // Ignore malformed or unsupported URLs.
+  }
+}
+
 function saveWindowState(window: BrowserWindow): void {
   try {
     const bounds = window.getBounds()
@@ -94,7 +104,7 @@ function createQuickMessageWindow(): BrowserWindow {
     backgroundColor: '#0a0a0a',
     webPreferences: {
       preload: join(__dirname, '../preload/index.js'),
-      sandbox: false,
+      sandbox: true,
       contextIsolation: true,
       nodeIntegration: false
     }
@@ -292,7 +302,7 @@ function createWindow(): BrowserWindow {
     backgroundColor: '#0a0a0a',
     webPreferences: {
       preload: join(__dirname, '../preload/index.js'),
-      sandbox: false,
+      sandbox: true,
       contextIsolation: true,
       nodeIntegration: false
     }
@@ -322,7 +332,7 @@ function createWindow(): BrowserWindow {
   })
 
   newWindow.webContents.setWindowOpenHandler((details) => {
-    shell.openExternal(details.url)
+    openExternalIfSafe(details.url)
     return { action: 'deny' }
   })
 

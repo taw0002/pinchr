@@ -71,6 +71,14 @@ async function runAppleScript(script: string): Promise<string> {
   }
 }
 
+function escapeAppleScriptString(value: string): string {
+  return value
+    .replace(/\\/g, '\\\\')
+    .replace(/"/g, '\\"')
+    .replace(/\r/g, ' ')
+    .replace(/\n/g, ' ')
+}
+
 // ── App Awareness ──────────────────────────────────────────────────────
 
 /**
@@ -159,10 +167,12 @@ export async function getOpenDocuments(appName?: string): Promise<OpenDocument[]
 }
 
 async function getDocsForApp(appName: string): Promise<OpenDocument[]> {
+  const escapedAppName = escapeAppleScriptString(appName)
+
   // First check if the app is running
   const checkScript = `
     tell application "System Events"
-      return (name of every process) contains "${appName}"
+      return (name of every process) contains "${escapedAppName}"
     end tell
   `
   const isRunning = await runAppleScript(checkScript)
@@ -285,7 +295,7 @@ async function getDocsForApp(appName: string): Promise<OpenDocument[]> {
     // Generic fallback — try getting window titles
     const genericScript = `
       tell application "System Events"
-        tell process "${appName}"
+        tell process "${escapedAppName}"
           set winList to ""
           repeat with win in windows
             set winList to winList & title of win & "|||" & "" & "\\n"
