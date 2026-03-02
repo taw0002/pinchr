@@ -53,7 +53,7 @@ export function OnboardingInstallCard({
   const statusLabel = gatewayReady
     ? 'Gateway ready'
     : state.preparing
-      ? 'Starting bundled gateway...'
+      ? 'Starting OpenClaw gateway...'
       : state.installing
         ? 'Preparing OpenClaw...'
         : 'Waiting for setup...'
@@ -68,7 +68,7 @@ export function OnboardingInstallCard({
       <div className="mb-4">
         <h3 className="mb-1 text-lg font-semibold text-text-primary">Set Up OpenClaw Gateway</h3>
         <p className="text-sm text-text-secondary">
-          Pinchr uses the OpenClaw runtime bundled with app updates.
+          Pinchr connects to a separately installed OpenClaw runtime.
         </p>
       </div>
 
@@ -81,7 +81,7 @@ export function OnboardingInstallCard({
             ) : (
               <TerminalSquare className="h-4 w-4 text-text-muted" />
             )}
-            <span>Bundled OpenClaw runtime</span>
+            <span>OpenClaw runtime</span>
           </div>
           {runtimeReady ? (
             <span className="text-xs font-medium text-accent">Done</span>
@@ -129,7 +129,7 @@ export function OnboardingInstallCard({
             className="h-56"
             initialCommand={installCommand}
             onExit={(data) => {
-              void onInstallTerminalExit(data.exitCode)
+              void onInstallTerminalExit(data.exitCode ?? null)
             }}
             onError={(message) => {
               void onInstallTerminalError(message)

@@ -2,6 +2,9 @@ import { contextBridge, ipcRenderer } from 'electron'
 import type {
   MCPServerConfig,
   MessageContentPart,
+  OnboardingInstallExitEvent,
+  OnboardingInstallOutputEvent,
+  OnboardingInstallCommand,
   ProviderId,
   StreamChunk,
   WorkspaceFileChangedEvent
@@ -23,6 +26,8 @@ ipcRenderer.on('gateway:stream-error', (_, data) => {
 // Embedded terminal event handlers
 const terminalDataHandlers = new Set<(data: string) => void>()
 const terminalExitHandlers = new Set<(data: { exitCode: number | null; signal: number | null }) => void>()
+const onboardingInstallOutputHandlers = new Set<(event: OnboardingInstallOutputEvent) => void>()
+const onboardingInstallExitHandlers = new Set<(event: OnboardingInstallExitEvent) => void>()
 
 ipcRenderer.on('terminal:data', (_, data) => {
   for (const handler of terminalDataHandlers) {
@@ -36,6 +41,31 @@ ipcRenderer.on('terminal:exit', (_, data) => {
     signal: typeof data?.signal === 'number' ? data.signal : null
   }
   for (const handler of terminalExitHandlers) {
+    handler(payload)
+  }
+})
+
+ipcRenderer.on('onboarding:install-output', (_, data) => {
+  const payload: OnboardingInstallOutputEvent = {
+    runId: String(data?.runId ?? ''),
+    command: data?.command as OnboardingInstallCommand,
+    stream: data?.stream === 'stderr' ? 'stderr' : 'stdout',
+    chunk: String(data?.chunk ?? '')
+  }
+  for (const handler of onboardingInstallOutputHandlers) {
+    handler(payload)
+  }
+})
+
+ipcRenderer.on('onboarding:install-exit', (_, data) => {
+  const payload: OnboardingInstallExitEvent = {
+    runId: String(data?.runId ?? ''),
+    command: data?.command as OnboardingInstallCommand,
+    code: typeof data?.code === 'number' ? data.code : null,
+    signal: typeof data?.signal === 'string' ? data.signal : null,
+    ok: data?.ok === true
+  }
+  for (const handler of onboardingInstallExitHandlers) {
     handler(payload)
   }
 })
@@ -70,6 +100,7 @@ const api = {
   downloadUpdate: () => ipcRenderer.invoke('updater:download'),
   restartToUpdate: () => ipcRenderer.invoke('updater:restart'),
   gateway: {
+    detect: () => ipcRenderer.invoke('gateway:detect'),
     health: () => ipcRenderer.invoke('gateway:health'),
     getSessions: () => ipcRenderer.invoke('gateway:sessions'),
     getAgentsList: () => ipcRenderer.invoke('gateway:agents-list'),
@@ -98,12 +129,9 @@ const api = {
       return () => streamHandlers.delete(`error-${streamId}`)
     },
     getConfig: () => ipcRenderer.invoke('gateway:config'),
-    getLegacyHomes: () => ipcRenderer.invoke('gateway:legacy-homes'),
-    cleanupLegacyHomes: (homes?: string[]) => ipcRenderer.invoke('gateway:cleanup-legacy-homes', homes),
     updateConfig: (config: Record<string, unknown>) =>
       ipcRenderer.invoke('gateway:update-config', config),
     restart: () => ipcRenderer.invoke('gateway:restart'),
-    repairShell: () => ipcRenderer.invoke('gateway:repair-shell'),
     startShell: () => ipcRenderer.invoke('gateway:start-shell'),
     getSessionStatus: () => ipcRenderer.invoke('gateway:session-status'),
     toolsInvoke: (tool: string, args?: Record<string, unknown>, sessionKey?: string) =>
@@ -197,10 +225,19 @@ const api = {
     installSkill: (skillName: string) =>
       ipcRenderer.invoke('onboarding:install-skill', skillName),
     systemCheck: () => ipcRenderer.invoke('onboarding:system-check'),
-    writeInitialConfig: () => ipcRenderer.invoke('onboarding:write-initial-config'),
-    prepareGateway: () => ipcRenderer.invoke('onboarding:prepare-gateway')
+    runInstall: (command: OnboardingInstallCommand) =>
+      ipcRenderer.invoke('onboarding:run-install', command),
+    onInstallOutput: (callback: (event: OnboardingInstallOutputEvent) => void) => {
+      onboardingInstallOutputHandlers.add(callback)
+      return () => onboardingInstallOutputHandlers.delete(callback)
+    },
+    onInstallExit: (callback: (event: OnboardingInstallExitEvent) => void) => {
+      onboardingInstallExitHandlers.add(callback)
+      return () => onboardingInstallExitHandlers.delete(callback)
+    }
   },
   terminal: {
+    checkOpenclaw: () => ipcRenderer.invoke('terminal:check-openclaw'),
     create: () => ipcRenderer.invoke('terminal:create'),
     write: (data: string) => ipcRenderer.invoke('terminal:write', data),
     resize: (cols: number, rows: number) => ipcRenderer.invoke('terminal:resize', cols, rows),

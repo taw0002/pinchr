@@ -29,7 +29,6 @@ export type DisplayMessage = Message & {
   _optimisticId?: string
   _optimisticState?: 'queued' | 'sending' | 'thinking' | 'pending' | 'failed'
   thinkingContent?: string
-  metadata?: Record<string, unknown>
   toolCalls?: ToolCallBlock[]
   subAgentEvents?: SubAgentEvent[]
   routeInfo?: {

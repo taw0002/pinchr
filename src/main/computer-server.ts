@@ -160,9 +160,8 @@ async function handleRequest(req: IncomingMessage, res: ServerResponse): Promise
     // POST /screenshot
     if (method === 'POST' && url === '/screenshot') {
       const body = await parseBody(req) as { mode?: 'screen' | 'window' | 'frontmost'; app?: string; windowTitle?: string }
-      const screenshotMode = body.mode === 'frontmost' ? 'window' : body.mode
       const result = await screenshot({
-        mode: screenshotMode || 'screen',
+        mode: body.mode || 'screen',
         app: body.windowTitle || body.app
       })
       sendJson(res, 200, { ok: true, data: result })

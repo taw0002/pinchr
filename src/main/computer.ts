@@ -15,10 +15,7 @@ import type {
 
 const execFileAsync = promisify(execFile)
 
-// TODO: Bundle peekaboo with the app for distribution
 const PEEKABOO_CANDIDATES = [
-  '/opt/homebrew/bin/peekaboo',
-  '/usr/local/bin/peekaboo',
   'peekaboo'
 ] as const
 const TMP_DIR = join(homedir(), '.openclaw', 'tmp')

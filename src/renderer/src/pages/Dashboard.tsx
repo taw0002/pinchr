@@ -187,8 +187,8 @@ export default function Dashboard({ onNavigate }: { onNavigate?: (page: Page) =>
     [config]
   )
   const configuredChannelCount = channelHealth.filter((channel) => channel.configured).length
-  const agentCount = Array.isArray(agents) ? agents.length : 0
-  const agentLoading = (identityLoading && !identityDoc) || (isOnline && agentsLoading && agentCount === 0)
+  const hasAgents = Array.isArray(agents) && agents.length > 0
+  const agentLoading = (identityLoading && !identityDoc) || (isOnline && agentsLoading && !hasAgents)
 
   useEffect(() => {
     waitingForPermissionGrantRef.current = waitingForPermissionGrant
@@ -490,7 +490,7 @@ ${query}`
                     )}
                     {isOnline && (
                       <p className="mt-1 truncate text-xs font-mono text-text-muted">
-                        {displayOpenclawVersion} (bundled)
+                        {displayOpenclawVersion} (external gateway)
                       </p>
                     )}
                   </div>

@@ -52,6 +52,15 @@ export function SimpleChatInput({ onSend, disabled = false }: SimpleChatInputPro
     growTextarea()
   }, [growTextarea, message])
 
+  // Auto-focus textarea when it becomes enabled (e.g. streaming finished)
+  const prevDisabledRef = useRef(disabled)
+  useEffect(() => {
+    if (prevDisabledRef.current && !disabled) {
+      textareaRef.current?.focus()
+    }
+    prevDisabledRef.current = disabled
+  }, [disabled])
+
   const addFiles = useCallback(async (files: File[]) => {
     if (files.length === 0) return
     const mapped = await Promise.all(files.map((file) => toAttachment(file)))

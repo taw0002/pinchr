@@ -115,10 +115,21 @@ function toRole(role: unknown): ChatRole {
   return 'assistant'
 }
 
-function parseTimestamp(timestamp?: string, fallback?: string): string {
-  if (timestamp) {
-    const parsed = Date.parse(timestamp)
-    if (Number.isFinite(parsed)) return new Date(parsed).toISOString()
+function parseTimestamp(timestamp?: string | number, fallback?: string): string {
+  if (timestamp != null) {
+    // Handle numeric epoch timestamps (ms)
+    if (typeof timestamp === 'number' && Number.isFinite(timestamp)) {
+      return new Date(timestamp).toISOString()
+    }
+    if (typeof timestamp === 'string') {
+      // Try parsing as numeric string first (epoch ms)
+      const num = Number(timestamp)
+      if (Number.isFinite(num) && timestamp.length >= 10 && /^\d+$/.test(timestamp)) {
+        return new Date(num).toISOString()
+      }
+      const parsed = Date.parse(timestamp)
+      if (Number.isFinite(parsed)) return new Date(parsed).toISOString()
+    }
   }
 
   return fallback ?? new Date().toISOString()
@@ -228,11 +239,20 @@ function getBridgeApi(): BridgeApi {
   }
 }
 
+function extractTimestamp(message: Message): string | number | undefined {
+  if (message.timestamp != null) return message.timestamp
+  // OpenClaw messages may use alternate timestamp field names
+  const raw = message as Record<string, unknown>
+  const alt = raw.at ?? raw.createdAt ?? raw.created_at
+  if (typeof alt === 'string' || typeof alt === 'number') return alt
+  return undefined
+}
+
 function buildHistoryEntries(messages: Message[]): SimpleChatEntry[] {
   const entries: SimpleChatEntry[] = []
 
   for (const message of messages) {
-    const timestamp = parseTimestamp(message.timestamp)
+    const timestamp = parseTimestamp(extractTimestamp(message))
     const content = extractMessageText(message)
     const classification = classifyMessage(message, content)
 
@@ -406,6 +426,17 @@ export function useSimpleChat(options: UseSimpleChatOptions = {}) {
     return () => window.clearInterval(timer)
   }, [refreshGatewayHealth])
 
+  // Poll for new messages periodically (every 5s) so messages from other channels appear in real-time
+  useEffect(() => {
+    if (!activeSessionKey || isStreaming) return
+
+    const pollTimer = window.setInterval(() => {
+      void loadHistory(activeSessionKey, historyLimit)
+    }, 5000)
+
+    return () => window.clearInterval(pollTimer)
+  }, [activeSessionKey, isStreaming, historyLimit, loadHistory])
+
   useEffect(() => {
     return () => teardownStream()
   }, [teardownStream])
@@ -564,7 +595,7 @@ export function useSimpleChat(options: UseSimpleChatOptions = {}) {
               } else {
                 nextToolCalls.push({
                   id: createId('tool'),
-                  toolName: chunk.toolName ?? 'tool',
+                  toolName: chunk.toolName,
                   status: 'completed',
                   result: chunk.toolResult,
                   timestamp: new Date().toISOString()

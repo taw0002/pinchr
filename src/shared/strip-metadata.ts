@@ -49,6 +49,9 @@ const METADATA_PATTERNS: RegExp[] = [
   // "[message_id: ...]" envelope tags
   /\[message_id:[^\]]*\]\s*/gi,
 
+  // OpenClaw reply directives: [[reply_to_current]], [[reply_to:<id>]]
+  /\[\[\s*reply_to_(?:current|\S+)\s*\]\]/g,
+
   // "Queued #N" prefix at line start (sometimes appears inline)
   /^Queued #\d+\s*/gm,
 ]

@@ -656,7 +656,7 @@ export function detectChannelBadge(message: DisplayMessage): ChannelBadge | null
   }
 
   // Parse channel from OpenClaw system message patterns
-  // e.g., "Slack DM from John Smith: ...", "WhatsApp message from ...", "Signal DM from ..."
+  // e.g., "Slack DM from Drew Wagner: ...", "WhatsApp message from ...", "Signal DM from ..."
   const systemChannelMatch = content.match(/\b(Slack|WhatsApp|Telegram|Discord|Signal|iMessage)\b/i)
   if (systemChannelMatch) {
     const channel = systemChannelMatch[1].toLowerCase()
@@ -665,7 +665,7 @@ export function detectChannelBadge(message: DisplayMessage): ChannelBadge | null
   }
 
   // Check for session key patterns in metadata
-  const metadata = message.metadata
+  const metadata = (message as Record<string, unknown>).metadata as Record<string, unknown> | undefined
   if (metadata) {
     const inboundContext = metadata.inbound_context as Record<string, unknown> | undefined
     if (inboundContext?.channel) {

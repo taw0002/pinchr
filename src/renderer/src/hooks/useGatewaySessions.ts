@@ -380,7 +380,7 @@ function normalizeHistoryMessages(payload: unknown): GatewaySessionMessage[] {
       if (!raw) return null
 
       const content = extractTextContent(raw.content)
-      const timestampMs = toTimestamp(raw.timestamp ?? raw.updatedAt ?? raw.createdAt)
+      const timestampMs = toTimestamp(raw.timestamp ?? raw.at ?? raw.updatedAt ?? raw.createdAt)
       const timestamp = timestampMs > 0 ? new Date(timestampMs).toISOString() : undefined
 
       return {
@@ -455,13 +455,12 @@ export function useGatewaySessions() {
 
 export function useSessionHistory(sessionKey: string | null) {
   return useQuery({
-    queryKey: ['gateway', 'tools', 'sessions_history', sessionKey],
+    queryKey: ['gateway', 'session-history', sessionKey],
     queryFn: async (): Promise<GatewaySessionMessage[]> => {
       if (!sessionKey) return []
-      const result: IpcResult<unknown> = await api().gateway.toolsInvoke('sessions_history', {
-        sessionKey,
-        limit: 30
-      })
+      // Use getSessionHistory IPC which has a disk-transcript fallback
+      // when the session isn't in the gateway's memory.
+      const result: IpcResult<unknown> = await api().gateway.getSessionHistory(sessionKey, 50)
       if (!result.ok) return []
       return normalizeHistoryMessages(result.data)
     },

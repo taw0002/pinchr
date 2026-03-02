@@ -1,27 +1,21 @@
 import { ipcMain, dialog, webContents, shell, app, type WebContents } from 'electron'
 import {
-  accessSync,
-  cpSync,
   readFileSync,
   writeFileSync,
-  chmodSync,
   readdirSync,
   existsSync,
   mkdirSync,
   copyFileSync,
   unlinkSync,
   statSync,
-  rmSync,
   openSync,
   readSync,
-  closeSync,
-  constants as fsConstants
+  closeSync
 } from 'fs'
-import { basename, dirname, extname, isAbsolute, join, relative, resolve, sep } from 'path'
+import { basename, dirname, extname, isAbsolute, join } from 'path'
 import { homedir } from 'os'
-import { exec, execFileSync } from 'child_process'
+import { exec, execSync, spawn, type ChildProcessWithoutNullStreams } from 'child_process'
 import { randomUUID } from 'crypto'
-import { createRequire } from 'module'
 import * as pty from 'node-pty'
 import {
   gatewayHealth,
@@ -43,6 +37,7 @@ import {
 import { routeMessageToTopicSession, type TopicRouteInboundContext } from './topic-router'
 import type {
   ActionType,
+  GatewayDetection,
   MCPConnectionTestResult,
   MCPServerConfig,
   MessageContentPart,
@@ -125,17 +120,13 @@ const PINCHR_CONFIG_PATH = join(homedir(), '.pinchr', 'config.json')
 const OPENCLAW_CONFIG_PATH = join(OPENCLAW_HOME_PATH, 'openclaw.json')
 const OPENCLAW_MAIN_AGENT_DIR = join(OPENCLAW_HOME_PATH, 'agents', 'main', 'agent')
 const OPENCLAW_AUTH_PROFILES_PATH = join(OPENCLAW_MAIN_AGENT_DIR, 'auth-profiles.json')
-const OPENCLAW_GATEWAY_LAUNCH_AGENT_PATH = join(homedir(), 'Library', 'LaunchAgents', 'ai.openclaw.gateway.plist')
-const OPENCLAW_NODE_LAUNCH_AGENT_PATH = join(homedir(), 'Library', 'LaunchAgents', 'ai.openclaw.node.plist')
 const OPENCLAW_LOGS_PATH = join(homedir(), '.openclaw', 'logs')
 const QUICK_ACTIONS_PATH = join(homedir(), '.pinchr', 'quick-actions.json')
 const TERMINAL_ROWS = 24
 const TERMINAL_COLS = 80
 const LOG_TAIL_MAX_BYTES = 400_000
 const OPENCLAW_LOG_FILENAMES = ['gateway.log', 'gateway.err.log', 'node.log', 'node.err.log'] as const
-const BUNDLED_OPENCLAW_ENTRY = 'openclaw/openclaw.mjs'
-const PINCHR_BIN_PATH = join(homedir(), '.pinchr', 'bin')
-const OPENCLAW_SHIM_MARKER = '# pinchr-openclaw-shim'
+const GATEWAY_HEALTH_URL = 'http://127.0.0.1:18789/health'
 const ONBOARDING_PROVIDER_DEFAULT_MODELS: Record<string, string> = {
   anthropic: 'anthropic/claude-sonnet-4-20250514',
   openai: 'openai/gpt-4.1',
@@ -157,7 +148,22 @@ type TerminalSession = {
 }
 
 const terminalSessions = new Map<number, TerminalSession>()
-let bundledOpenclawScriptPath: string | null | undefined
+type OnboardingInstallCommand =
+  | 'npm i -g openclaw'
+  | 'openclaw gateway install'
+  | 'openclaw gateway start'
+  | 'openclaw setup'
+type OnboardingInstallRun = {
+  runId: string
+  process: ChildProcessWithoutNullStreams
+}
+const onboardingInstallRuns = new Map<number, OnboardingInstallRun>()
+const ALLOWED_ONBOARDING_INSTALL_COMMANDS = new Set<OnboardingInstallCommand>([
+  'npm i -g openclaw',
+  'openclaw gateway install',
+  'openclaw gateway start',
+  'openclaw setup'
+])
 
 function resolveShell(): string {
   if (process.platform === 'win32') {
@@ -169,10 +175,181 @@ function resolveShell(): string {
   return process.env.SHELL || '/bin/bash'
 }
 
+function resolveShellArgs(shellPath: string): string[] {
+  if (process.platform === 'win32') return []
+
+  const shellName = basename(shellPath).toLowerCase()
+  if (shellName === 'bash' || shellName === 'zsh' || shellName === 'fish') {
+    return ['-l']
+  }
+
+  return []
+}
+
 function sendTerminalEvent(senderId: number, channel: string, payload: unknown): void {
   const targetContents = webContents.fromId(senderId)
   if (!targetContents || targetContents.isDestroyed()) return
   targetContents.send(channel, payload)
+}
+
+function sendOnboardingInstallEvent(
+  senderId: number,
+  channel: 'onboarding:install-output' | 'onboarding:install-exit',
+  payload: unknown
+): void {
+  const targetContents = webContents.fromId(senderId)
+  if (!targetContents || targetContents.isDestroyed()) return
+  targetContents.send(channel, payload)
+}
+
+function closeOnboardingInstallRun(senderId: number, fromExit = false): boolean {
+  const run = onboardingInstallRuns.get(senderId)
+  if (!run) return false
+
+  onboardingInstallRuns.delete(senderId)
+  if (!fromExit) {
+    try {
+      run.process.kill()
+    } catch {
+      // Ignore kill errors if process already ended.
+    }
+  }
+
+  return true
+}
+
+function parseSemverTuple(version: string): [number, number, number] | null {
+  const match = version.match(/^v?(\d+)\.(\d+)\.(\d+)$/)
+  if (!match) return null
+  return [Number(match[1]), Number(match[2]), Number(match[3])]
+}
+
+function sortNodeVersionsDescending(versions: string[]): string[] {
+  return [...versions].sort((left, right) => {
+    const leftTuple = parseSemverTuple(left) ?? [0, 0, 0]
+    const rightTuple = parseSemverTuple(right) ?? [0, 0, 0]
+    if (leftTuple[0] !== rightTuple[0]) return rightTuple[0] - leftTuple[0]
+    if (leftTuple[1] !== rightTuple[1]) return rightTuple[1] - leftTuple[1]
+    return rightTuple[2] - leftTuple[2]
+  })
+}
+
+function resolveNvmVersionFromAlias(
+  nvmDir: string,
+  alias: string,
+  availableVersions: string[]
+): string | null {
+  const trimmedAlias = alias.trim()
+  if (!trimmedAlias) return null
+
+  if (/^\d+\.\d+\.\d+$/.test(trimmedAlias)) {
+    const prefixed = `v${trimmedAlias}`
+    return availableVersions.includes(prefixed) ? prefixed : null
+  }
+  if (/^v\d+\.\d+\.\d+$/.test(trimmedAlias)) {
+    return availableVersions.includes(trimmedAlias) ? trimmedAlias : null
+  }
+  if (trimmedAlias === 'node' || trimmedAlias === 'stable') {
+    return availableVersions[0] ?? null
+  }
+  if (trimmedAlias.startsWith('lts/')) {
+    const ltsAlias = trimmedAlias.slice('lts/'.length)
+    if (!ltsAlias) return null
+    const ltsAliasPath = join(nvmDir, 'alias', 'lts', ltsAlias)
+    if (!existsSync(ltsAliasPath)) return null
+    try {
+      const ltsTarget = readFileSync(ltsAliasPath, 'utf-8').trim()
+      if (/^\d+\.\d+\.\d+$/.test(ltsTarget)) {
+        const prefixed = `v${ltsTarget}`
+        return availableVersions.includes(prefixed) ? prefixed : null
+      }
+      return availableVersions.includes(ltsTarget) ? ltsTarget : null
+    } catch {
+      return null
+    }
+  }
+
+  return null
+}
+
+function getNvmBinPaths(): string[] {
+  const results = new Set<string>()
+  const explicitNvmBin = readNonEmptyString(process.env.NVM_BIN)
+  if (explicitNvmBin) {
+    results.add(explicitNvmBin)
+  }
+
+  const nvmDir = readNonEmptyString(process.env.NVM_DIR) || join(homedir(), '.nvm')
+  const versionsRoot = join(nvmDir, 'versions', 'node')
+  if (!existsSync(versionsRoot)) {
+    return Array.from(results)
+  }
+
+  const availableVersions = sortNodeVersionsDescending(
+    readdirSync(versionsRoot).filter((entry) => /^v\d+\.\d+\.\d+$/.test(entry))
+  )
+  if (availableVersions.length === 0) {
+    return Array.from(results)
+  }
+
+  const candidates = new Set<string>()
+  const nodeVersion = readNonEmptyString(process.version)
+  if (nodeVersion) {
+    candidates.add(nodeVersion.startsWith('v') ? nodeVersion : `v${nodeVersion}`)
+  }
+
+  const nvmInc = readNonEmptyString(process.env.NVM_INC)
+  const nvmIncVersionMatch = nvmInc?.match(/\/versions\/node\/(v\d+\.\d+\.\d+)\/include\/node$/)
+  if (nvmIncVersionMatch) {
+    candidates.add(nvmIncVersionMatch[1])
+  }
+
+  const defaultAliasPath = join(nvmDir, 'alias', 'default')
+  if (existsSync(defaultAliasPath)) {
+    try {
+      const alias = readFileSync(defaultAliasPath, 'utf-8')
+      const aliasedVersion = resolveNvmVersionFromAlias(nvmDir, alias, availableVersions)
+      if (aliasedVersion) {
+        candidates.add(aliasedVersion)
+      }
+    } catch {
+      // Ignore alias parsing errors.
+    }
+  }
+
+  candidates.add(availableVersions[0])
+
+  for (const candidate of candidates) {
+    if (!candidate || !availableVersions.includes(candidate)) continue
+    results.add(join(versionsRoot, candidate, 'bin'))
+  }
+
+  return Array.from(results)
+}
+
+function commandPath(): string {
+  const segments = [
+    join(OPENCLAW_HOME_PATH, 'bin'),
+    '/opt/homebrew/bin',
+    '/usr/local/bin',
+    join(homedir(), 'bin'),
+    join(homedir(), '.local', 'bin'),
+    ...getNvmBinPaths(),
+    process.env.PATH || ''
+  ]
+    .flatMap((entry) => entry.split(':'))
+    .map((entry) => entry.trim())
+    .filter(Boolean)
+
+  return Array.from(new Set(segments)).join(':')
+}
+
+function shellEnv(): NodeJS.ProcessEnv {
+  return {
+    ...process.env,
+    PATH: commandPath(),
+    OPENCLAW_HOME: process.env.OPENCLAW_HOME || OPENCLAW_HOME_PATH
+  }
 }
 
 function closeTerminalSession(senderId: number, fromExit = false): boolean {
@@ -196,16 +373,15 @@ function createTerminalSession(sender: WebContents): { ok: boolean; error?: stri
   closeTerminalSession(senderId)
 
   try {
-    const ptyProcess = pty.spawn(resolveShell(), [], {
+    const shellPath = resolveShell()
+    const ptyProcess = pty.spawn(shellPath, resolveShellArgs(shellPath), {
       name: 'xterm-256color',
       cols: TERMINAL_COLS,
       rows: TERMINAL_ROWS,
       cwd: WORKSPACE_PATH,
       env: {
-        ...process.env,
+        ...shellEnv(),
         TERM: 'xterm-256color',
-        PATH: commandPath(),
-        OPENCLAW_HOME: process.env.OPENCLAW_HOME || OPENCLAW_HOME_PATH
       }
     })
 
@@ -317,233 +493,6 @@ function writeOpenClawConfig(config: Record<string, unknown>): void {
   writeFileSync(OPENCLAW_CONFIG_PATH, JSON.stringify(config, null, 2))
 }
 
-function readGatewayConfigToken(): string | null {
-  const config = readOpenClawConfig()
-  const gateway = isPlainRecord(config.gateway) ? (config.gateway as Record<string, unknown>) : null
-  const auth = gateway && isPlainRecord(gateway.auth) ? (gateway.auth as Record<string, unknown>) : null
-  return readNonEmptyString(auth?.token) ?? null
-}
-
-function readGatewayLaunchAgentToken(): string | null {
-  try {
-    if (!existsSync(OPENCLAW_GATEWAY_LAUNCH_AGENT_PATH)) return null
-    const plist = readFileSync(OPENCLAW_GATEWAY_LAUNCH_AGENT_PATH, 'utf-8')
-    const match = plist.match(
-      /<key>\s*OPENCLAW_GATEWAY_TOKEN\s*<\/key>\s*<string>\s*([^<]+?)\s*<\/string>/i
-    )
-    return readNonEmptyString(match?.[1]) ?? null
-  } catch {
-    return null
-  }
-}
-
-function readLaunchAgentEnvValue(plistPath: string, envKey: string): string | null {
-  try {
-    if (!existsSync(plistPath)) return null
-    const plist = readFileSync(plistPath, 'utf-8')
-    const escapedKey = envKey.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')
-    const pattern = new RegExp(
-      `<key>\\s*${escapedKey}\\s*<\\/key>\\s*<string>\\s*([^<]+?)\\s*<\\/string>`,
-      'i'
-    )
-    const match = plist.match(pattern)
-    return readNonEmptyString(match?.[1]) ?? null
-  } catch {
-    return null
-  }
-}
-
-function discoverLegacyOpenclawHomes(): string[] {
-  const candidates = [
-    readLaunchAgentEnvValue(OPENCLAW_GATEWAY_LAUNCH_AGENT_PATH, 'OPENCLAW_HOME'),
-    readLaunchAgentEnvValue(OPENCLAW_NODE_LAUNCH_AGENT_PATH, 'OPENCLAW_HOME')
-  ]
-    .filter((value): value is string => Boolean(value))
-    .map((value) => value.trim())
-    .filter((value) => value.length > 0 && isAbsolute(value))
-    .filter((value) => value !== OPENCLAW_HOME_PATH)
-
-  return Array.from(new Set(candidates))
-}
-
-function migrateLegacyOpenclawConfigIfNeeded(): { migrated: boolean; sourceHome?: string } {
-  if (existsSync(OPENCLAW_CONFIG_PATH)) return { migrated: false }
-
-  const legacyHomes = discoverLegacyOpenclawHomes()
-  for (const sourceHome of legacyHomes) {
-    const sourceConfigPath = join(sourceHome, 'openclaw.json')
-    if (!existsSync(sourceConfigPath)) continue
-
-    try {
-      if (!existsSync(OPENCLAW_HOME_PATH)) {
-        mkdirSync(OPENCLAW_HOME_PATH, { recursive: true })
-      }
-
-      copyFileSync(sourceConfigPath, OPENCLAW_CONFIG_PATH)
-
-      const sourceAuthProfilesPath = join(sourceHome, 'agents', 'main', 'agent', 'auth-profiles.json')
-      if (existsSync(sourceAuthProfilesPath) && !existsSync(OPENCLAW_AUTH_PROFILES_PATH)) {
-        if (!existsSync(OPENCLAW_MAIN_AGENT_DIR)) {
-          mkdirSync(OPENCLAW_MAIN_AGENT_DIR, { recursive: true })
-        }
-        copyFileSync(sourceAuthProfilesPath, OPENCLAW_AUTH_PROFILES_PATH)
-      }
-
-      return { migrated: true, sourceHome }
-    } catch {
-      // Keep scanning other candidates.
-    }
-  }
-
-  return { migrated: false }
-}
-
-interface LegacyOpenclawCleanupResult {
-  managedHome: string
-  archived: Array<{ source: string; archive: string }>
-  removed: string[]
-  skipped: Array<{ home: string; reason: string }>
-}
-
-function isManagedOpenclawHomePath(pathValue: string): boolean {
-  return pathValue.replace(/\/+$/, '') === OPENCLAW_HOME_PATH.replace(/\/+$/, '')
-}
-
-function isCleanupTargetSafe(pathValue: string): boolean {
-  const normalized = pathValue.replace(/\/+$/, '')
-  const home = homedir().replace(/\/+$/, '')
-  return isAbsolute(normalized) && normalized.startsWith(`${home}/`) && !isManagedOpenclawHomePath(normalized)
-}
-
-function createLegacyOpenclawArchivePath(sourceHome: string): string {
-  const backupRoot = join(homedir(), '.pinchr', 'backups', 'openclaw')
-  if (!existsSync(backupRoot)) {
-    mkdirSync(backupRoot, { recursive: true })
-  }
-
-  const safeBase = basename(sourceHome).replace(/[^a-zA-Z0-9._-]+/g, '-') || 'openclaw-home'
-  const timestamp = new Date().toISOString().replace(/[:.]/g, '-')
-  let archivePath = join(backupRoot, `${safeBase}-${timestamp}`)
-  let suffix = 1
-  while (existsSync(archivePath)) {
-    archivePath = join(backupRoot, `${safeBase}-${timestamp}-${suffix}`)
-    suffix += 1
-  }
-  return archivePath
-}
-
-function cleanupLegacyOpenclawHomes(requestedHomes?: string[]): LegacyOpenclawCleanupResult {
-  const discovered = discoverLegacyOpenclawHomes()
-  const discoveredSet = new Set(discovered)
-
-  const requested = Array.isArray(requestedHomes)
-    ? requestedHomes.map((home) => home.trim()).filter(Boolean)
-    : []
-  const targets = requested.length > 0 ? Array.from(new Set(requested)) : discovered
-
-  const archived: Array<{ source: string; archive: string }> = []
-  const removed: string[] = []
-  const skipped: Array<{ home: string; reason: string }> = []
-
-  for (const home of targets) {
-    if (!discoveredSet.has(home)) {
-      skipped.push({ home, reason: 'not_discovered' })
-      continue
-    }
-
-    if (!isCleanupTargetSafe(home)) {
-      skipped.push({ home, reason: 'unsafe_path' })
-      continue
-    }
-
-    if (!existsSync(home)) {
-      skipped.push({ home, reason: 'path_missing' })
-      continue
-    }
-
-    if (!existsSync(join(home, 'openclaw.json'))) {
-      skipped.push({ home, reason: 'missing_openclaw_config' })
-      continue
-    }
-
-    const archivePath = createLegacyOpenclawArchivePath(home)
-    try {
-      cpSync(home, archivePath, {
-        recursive: true,
-        force: false,
-        errorOnExist: true,
-        preserveTimestamps: true
-      })
-      rmSync(home, { recursive: true, force: true })
-      archived.push({ source: home, archive: archivePath })
-      removed.push(home)
-    } catch (error) {
-      skipped.push({ home, reason: `archive_or_remove_failed: ${String(error)}` })
-      if (existsSync(archivePath)) {
-        try {
-          rmSync(archivePath, { recursive: true, force: true })
-        } catch {
-          // Best-effort rollback cleanup.
-        }
-      }
-    }
-  }
-
-  return {
-    managedHome: OPENCLAW_HOME_PATH,
-    archived,
-    removed,
-    skipped
-  }
-}
-
-function hasGatewayTokenDrift(): boolean {
-  const configToken = readGatewayConfigToken()
-  const launchAgentToken = readGatewayLaunchAgentToken()
-  if (!configToken || !launchAgentToken) return false
-  return configToken !== launchAgentToken
-}
-
-function isGatewayAuthFailure(error: unknown): boolean {
-  const text = String(error ?? '').toLowerCase()
-  return text.includes('token mismatch')
-    || text.includes('unauthorized')
-    || text.includes('401')
-    || text.includes('code=1008')
-}
-
-async function attemptGatewaySelfRepair(triggerError?: unknown): Promise<{
-  attempted: boolean
-  ok: boolean
-  output: string
-}> {
-  const shouldRepair = hasGatewayTokenDrift() || isGatewayAuthFailure(triggerError)
-  if (!shouldRepair) return { attempted: false, ok: false, output: '' }
-
-  const prepared = await prepareGatewayRuntime()
-  return {
-    attempted: true,
-    ok: prepared.ok,
-    output: prepared.output || ''
-  }
-}
-
-async function runGatewayOpWithAutoRepair<T>(operation: () => Promise<T>): Promise<T> {
-  try {
-    return await operation()
-  } catch (error) {
-    const repairResult = await attemptGatewaySelfRepair(error)
-    if (!repairResult.attempted) {
-      throw error
-    }
-    if (!repairResult.ok) {
-      const message = repairResult.output || 'Gateway self-repair failed.'
-      throw new Error(`${String(error)}\n\n${message}`)
-    }
-    return await operation()
-  }
-}
-
 function readAuthProfiles(): Record<string, unknown> {
   try {
     if (!existsSync(OPENCLAW_AUTH_PROFILES_PATH)) {
@@ -570,190 +519,87 @@ function providerDefaultModel(provider: string): string {
   return ONBOARDING_PROVIDER_DEFAULT_MODELS[provider] || ONBOARDING_PROVIDER_DEFAULT_MODELS.anthropic
 }
 
-function getBundledNodePath(): string | null {
-  // Bundled Node binary at <app>/Contents/Resources/node/node
-  const bundledNode = join(process.resourcesPath, 'node', 'node')
-  if (existsSync(bundledNode)) return bundledNode
-  // Dev fallback: resources/node/node relative to project root
-  const devNode = join(__dirname, '..', '..', 'resources', 'node', 'node')
-  if (existsSync(devNode)) return devNode
-  return null
+function readGatewayTokenFromConfig(config: Record<string, unknown>): string | null {
+  const gateway = isPlainRecord(config.gateway) ? config.gateway : null
+  const auth = gateway && isPlainRecord(gateway.auth) ? gateway.auth : null
+  return readNonEmptyString(auth?.token) ?? null
 }
 
-function getBundledPeekabooDir(): string | null {
-  // Bundled peekaboo binary at <app>/Contents/Resources/peekaboo/peekaboo
-  const bundledPeekaboo = join(process.resourcesPath, 'peekaboo', 'peekaboo')
-  if (existsSync(bundledPeekaboo)) return dirname(bundledPeekaboo)
-  // Dev fallback: resources/peekaboo/peekaboo relative to project root
-  const devPeekaboo = join(__dirname, '..', '..', 'resources', 'peekaboo', 'peekaboo')
-  if (existsSync(devPeekaboo)) return dirname(devPeekaboo)
-  return null
-}
+function hasConfiguredApiKey(config: Record<string, unknown>): boolean {
+  const env = isPlainRecord(config.env) ? config.env : null
+  const vars = env && isPlainRecord(env.vars) ? env.vars : null
 
-function getBundledOpenclawScriptPath(): string | null {
-  if (bundledOpenclawScriptPath !== undefined) return bundledOpenclawScriptPath
-  try {
-    const unpackedPath = join(
-      process.resourcesPath,
-      'app.asar.unpacked',
-      'node_modules',
-      'openclaw',
-      'openclaw.mjs'
-    )
-    if (existsSync(unpackedPath)) {
-      bundledOpenclawScriptPath = unpackedPath
-      return bundledOpenclawScriptPath
-    }
-
-    const require = createRequire(import.meta.url)
-    bundledOpenclawScriptPath = require.resolve(BUNDLED_OPENCLAW_ENTRY)
-  } catch {
-    bundledOpenclawScriptPath = null
-  }
-  return bundledOpenclawScriptPath
-}
-
-function buildOpenclawShimScript(bundledScriptPath: string, bundledNode: string | null): string {
-  const nodeResolution = bundledNode
-    ? `OPENCLAW_NODE_BIN="${bundledNode}"`
-    : [
-        'OPENCLAW_NODE_BIN="${OPENCLAW_NODE_BIN:-$(command -v node 2>/dev/null || true)}"',
-        `if [ -z "$OPENCLAW_NODE_BIN" ]; then OPENCLAW_NODE_BIN="${process.execPath}"; fi`
-      ].join('\n')
-
-  return [
-    '#!/bin/sh',
-    OPENCLAW_SHIM_MARKER,
-    'export OPENCLAW_HOME="${OPENCLAW_HOME:-$HOME/.openclaw}"',
-    nodeResolution,
-    'export ELECTRON_RUN_AS_NODE=1',
-    `exec "$OPENCLAW_NODE_BIN" "${bundledScriptPath}" "$@"`
-  ].join('\n')
-}
-
-function isManagedOpenclawShimScript(script: string): boolean {
-  return script.includes(OPENCLAW_SHIM_MARKER)
-    || (
-      script.includes('app.asar.unpacked/node_modules/openclaw/openclaw.mjs')
-      && script.includes('OPENCLAW_HOME')
-      && script.includes('ELECTRON_RUN_AS_NODE=1')
-    )
-}
-
-function writeManagedOpenclawShim(shimPath: string, script: string): boolean {
-  try {
-    const existing = existsSync(shimPath) ? readFileSync(shimPath, 'utf-8') : ''
-    if (existing && existing !== script && !isManagedOpenclawShimScript(existing)) {
-      return false
-    }
-
-    if (existing !== script) {
-      writeFileSync(shimPath, script, 'utf-8')
-    }
-    chmodSync(shimPath, 0o755)
+  const envKeys = [
+    vars?.ANTHROPIC_API_KEY,
+    vars?.OPENAI_API_KEY,
+    vars?.GOOGLE_API_KEY,
+    vars?.GEMINI_API_KEY,
+    env?.ANTHROPIC_API_KEY,
+    env?.OPENAI_API_KEY,
+    env?.GOOGLE_API_KEY,
+    env?.GEMINI_API_KEY
+  ]
+  if (envKeys.some((value) => Boolean(readNonEmptyString(value)))) {
     return true
-  } catch {
-    return false
   }
-}
 
-function hasUnmanagedOpenclawOnPath(): boolean {
-  const pathEntries = (process.env.PATH || '')
-    .split(':')
-    .map((entry) => entry.trim())
-    .filter(Boolean)
-
-  for (const dir of pathEntries) {
-    if (!isAbsolute(dir)) continue
-    const candidate = join(dir, 'openclaw')
-    if (!existsSync(candidate)) continue
-
-    try {
-      accessSync(candidate, fsConstants.X_OK)
-    } catch {
-      continue
+  const providers = isPlainRecord(config.providers) ? config.providers : null
+  if (providers) {
+    for (const providerId of ['anthropic', 'openai', 'google', 'groq']) {
+      const providerConfig = isPlainRecord(providers[providerId]) ? providers[providerId] : null
+      if (readNonEmptyString(providerConfig?.apiKey)) return true
     }
+  }
 
-    try {
-      const stats = statSync(candidate)
-      if (!stats.isFile() || stats.size > 128 * 1024) {
-        return true
-      }
-      const content = readFileSync(candidate, 'utf-8')
-      if (!isManagedOpenclawShimScript(content)) {
-        return true
-      }
-    } catch {
-      return true
+  const authProfiles = readAuthProfiles()
+  const profiles = isPlainRecord(authProfiles.profiles) ? authProfiles.profiles : null
+  if (profiles) {
+    for (const value of Object.values(profiles)) {
+      const profile = isPlainRecord(value) ? value : null
+      if (readNonEmptyString(profile?.key)) return true
     }
   }
 
   return false
 }
 
-function ensureOpenclawShimOnUserPath(script: string): void {
+async function detectGateway(): Promise<GatewayDetection> {
+  const configExists = existsSync(OPENCLAW_CONFIG_PATH)
+  const config = readOpenClawConfig()
+  const token = readGatewayTokenFromConfig(config)
+  const hasApiKey = hasConfiguredApiKey(config)
+
   try {
-    if (hasUnmanagedOpenclawOnPath()) {
-      return
-    }
+    const response = await fetchWithTimeout(
+      GATEWAY_HEALTH_URL,
+      {
+        method: 'GET'
+      },
+      2500
+    )
 
-    const home = homedir()
-    const pathEntries = (process.env.PATH || '')
-      .split(':')
-      .map((entry) => entry.trim())
-      .filter(Boolean)
-
-    const preferred = [join(home, '.local', 'bin'), join(home, 'bin')]
-    const candidates = Array.from(new Set([...pathEntries, ...preferred]))
-
-    for (const dir of candidates) {
-      if (!isAbsolute(dir)) continue
-
-      const inHome = dir === home || dir.startsWith(`${home}/`)
-      if (!existsSync(dir)) {
-        if (!inHome) continue
-        try {
-          mkdirSync(dir, { recursive: true })
-        } catch {
-          continue
-        }
-      }
-
-      try {
-        accessSync(dir, fsConstants.W_OK | fsConstants.X_OK)
-      } catch {
-        continue
-      }
-
-      const shimPath = join(dir, 'openclaw')
-      if (writeManagedOpenclawShim(shimPath, script)) {
-        return
+    // Any HTTP response (even 503 from missing UI assets) means the gateway is running.
+    // The /health endpoint returns 503 when Control UI isn't built, but the gateway
+    // API itself is fully functional.
+    if (response.status > 0) {
+      return {
+        status: 'connected',
+        url: 'http://127.0.0.1:18789',
+        token,
+        hasApiKey,
+        configExists
       }
     }
   } catch {
-    // Best-effort only.
+    // Gateway unavailable.
   }
-}
 
-function ensureBundledOpenclawShim(): string | null {
-  const bundledScriptPath = getBundledOpenclawScriptPath()
-  if (!bundledScriptPath) return null
-
-  try {
-    if (!existsSync(PINCHR_BIN_PATH)) {
-      mkdirSync(PINCHR_BIN_PATH, { recursive: true })
-    }
-
-    const shimPath = join(PINCHR_BIN_PATH, 'openclaw')
-    const bundledNode = getBundledNodePath()
-    const script = buildOpenclawShimScript(bundledScriptPath, bundledNode)
-
-    writeManagedOpenclawShim(shimPath, script)
-    ensureOpenclawShimOnUserPath(script)
-
-    return PINCHR_BIN_PATH
-  } catch {
-    return null
+  return {
+    status: 'not-found',
+    url: 'http://127.0.0.1:18789',
+    token,
+    hasApiKey,
+    configExists
   }
 }
 
@@ -901,123 +747,14 @@ function mergePinchrDefaults(
   return { config, changed }
 }
 
-function commandPath(): string {
-  const bundledShimDir = ensureBundledOpenclawShim()
-  const bundledNodeDir = getBundledNodePath()
-  const bundledNodeBinDir = bundledNodeDir ? join(bundledNodeDir, '..') : ''
-  const bundledPeekabooDir = getBundledPeekabooDir()
-  const segments = [
-    bundledPeekabooDir || '',
-    PINCHR_BIN_PATH,
-    bundledShimDir || '',
-    bundledNodeBinDir,
-    join(OPENCLAW_HOME_PATH, 'bin'),
-    '/opt/homebrew/bin',
-    '/usr/local/bin',
-    process.env.PATH || ''
-  ]
-    .flatMap((entry) => entry.split(':'))
-    .map((entry) => entry.trim())
-    .filter(Boolean)
-
-  return Array.from(new Set(segments)).join(':')
-}
-
 async function sleep(ms: number): Promise<void> {
   await new Promise((resolve) => setTimeout(resolve, ms))
-}
-
-function buildGatewayRepairCommand(): string {
-  return [
-    'command -v openclaw >/dev/null 2>&1 || { echo "openclaw not found in PATH"; exit 127; }',
-    'openclaw setup --local',
-    'launchctl bootout gui/$UID/ai.openclaw.node >/dev/null 2>&1 || true',
-    'rm -f "$HOME/Library/LaunchAgents/ai.openclaw.node.plist" || true',
-    'openclaw gateway uninstall || true',
-    'launchctl bootout gui/$UID/ai.openclaw.gateway >/dev/null 2>&1 || true',
-    'rm -f "$HOME/Library/LaunchAgents/ai.openclaw.gateway.plist" || true',
-    'openclaw gateway install --force --port 18789',
-    'openclaw gateway start || openclaw gateway restart',
-    'openclaw gateway status'
-  ].join('\n')
-}
-
-async function isGatewayReachable(): Promise<boolean> {
-  try {
-    await gatewayHealth()
-    return true
-  } catch {
-    return false
-  }
-}
-
-async function waitForGatewayReachable(attempts = 8, delayMs = 2000): Promise<boolean> {
-  for (let i = 0; i < attempts; i += 1) {
-    const reachable = await isGatewayReachable()
-    if (reachable) return true
-    await sleep(delayMs)
-  }
-  return false
-}
-
-async function prepareGatewayRuntime(): Promise<{ ok: boolean; output: string }> {
-  const initResult = await writeInitialOpenClawConfig({ forceLocalGateway: true })
-  if (!initResult.ok) {
-    return {
-      ok: false,
-      output: initResult.output || 'Failed to initialize OpenClaw config.'
-    }
-  }
-
-  const repairResult = await runShellCommand(buildGatewayRepairCommand(), 3 * 60_000)
-  let gatewayReachable = await waitForGatewayReachable()
-
-  let retryOutput = ''
-  if (!gatewayReachable) {
-    const retryResult = await runShellCommand(
-      [
-        'openclaw gateway restart || openclaw gateway start || true',
-        'openclaw gateway status || true'
-      ].join('\n'),
-      90_000
-    )
-    retryOutput = retryResult.output || ''
-    gatewayReachable = await waitForGatewayReachable(6, 1500)
-  }
-
-  const combined = [initResult.output, repairResult.output, retryOutput]
-    .filter(Boolean)
-    .join('\n\n')
-    .trim()
-
-  if (!repairResult.ok && !gatewayReachable) {
-    return {
-      ok: false,
-      output: combined || 'Gateway repair command failed before connectivity checks.'
-    }
-  }
-
-  if (!gatewayReachable) {
-    return {
-      ok: false,
-      output: combined || 'Gateway is still offline after repair attempts.'
-    }
-  }
-
-  return {
-    ok: true,
-    output: combined || 'Gateway prepared and reachable.'
-  }
 }
 
 async function writeInitialOpenClawConfig(options?: {
   forceLocalGateway?: boolean
 }): Promise<{ ok: boolean; output: string; created: boolean }> {
   const forceLocalGateway = options?.forceLocalGateway === true
-  const migration = migrateLegacyOpenclawConfigIfNeeded()
-  const migrationNote = migration.migrated && migration.sourceHome
-    ? `Migrated existing OpenClaw config from ${migration.sourceHome}.`
-    : ''
 
   if (existsSync(OPENCLAW_CONFIG_PATH)) {
     if (!existsSync(OPENCLAW_MAIN_AGENT_DIR)) {
@@ -1027,21 +764,9 @@ async function writeInitialOpenClawConfig(options?: {
     const merged = mergePinchrDefaults(existingConfig, 'anthropic', { forceLocalGateway })
     if (merged.changed) {
       writeOpenClawConfig(merged.config)
-      return {
-        ok: true,
-        output: [migrationNote, 'openclaw.json exists. Appended Pinchr defaults without overwriting user settings.']
-          .filter(Boolean)
-          .join(' '),
-        created: false
-      }
+      return { ok: true, output: 'openclaw.json exists. Appended Pinchr defaults without overwriting user settings.', created: false }
     }
-    return {
-      ok: true,
-      output: [migrationNote, 'openclaw.json already exists. No default changes needed.']
-        .filter(Boolean)
-        .join(' '),
-      created: false
-    }
+    return { ok: true, output: 'openclaw.json already exists. No default changes needed.', created: false }
   }
 
   if (!existsSync(OPENCLAW_MAIN_AGENT_DIR)) {
@@ -1184,43 +909,20 @@ async function runShellCommand(
   command: string,
   timeoutMs = 60_000
 ): Promise<{ ok: boolean; output: string; code: number | null }> {
-  const bundledOpenclaw = getBundledOpenclawScriptPath()
-  const bundledNode = getBundledNodePath()
-  const nodeResolution = bundledNode
-    ? `  __openclaw_node=${shellEscapeArg(bundledNode)}`
-    : [
-        '  __openclaw_node="${OPENCLAW_NODE_BIN:-$(command -v node 2>/dev/null || true)}"',
-        `  if [ -z "$__openclaw_node" ]; then __openclaw_node=${shellEscapeArg(process.execPath)}; fi`
-      ].join('\n')
-  const commandWithBundledOpenclaw = bundledOpenclaw
-    ? [
-        'openclaw() {',
-        '  local __openclaw_node',
-        nodeResolution,
-        `  ELECTRON_RUN_AS_NODE=1 "$__openclaw_node" ${shellEscapeArg(bundledOpenclaw)} "$@"`,
-        '}',
-        command
-      ].join('\n')
-    : command
-
   return await new Promise((resolve) => {
     exec(
-      commandWithBundledOpenclaw,
+      command,
       {
         shell: '/bin/zsh',
         timeout: timeoutMs,
         maxBuffer: 8 * 1024 * 1024,
-        env: {
-          ...process.env,
-          PATH: commandPath(),
-          OPENCLAW_HOME: process.env.OPENCLAW_HOME || OPENCLAW_HOME_PATH
-        }
+        env: shellEnv()
       },
       (error, stdout, stderr) => {
         const output = `${stdout || ''}${stderr || ''}`.trim()
         if (error) {
-          const errorCode = (error as NodeJS.ErrnoException).code
-          const code = typeof errorCode === 'number' ? errorCode : null
+          const rawCode = (error as NodeJS.ErrnoException).code
+          const code = typeof rawCode === 'number' ? rawCode : null
           resolve({ ok: false, output, code })
           return
         }
@@ -1287,30 +989,6 @@ function sanitizeFilename(value: string): string {
   return base || 'attachment'
 }
 
-function isPathWithinBase(basePath: string, targetPath: string): boolean {
-  const resolvedBase = resolve(basePath)
-  const resolvedTarget = resolve(targetPath)
-  return resolvedTarget === resolvedBase || resolvedTarget.startsWith(`${resolvedBase}${sep}`)
-}
-
-function resolveWorkspacePath(inputPath: string, options?: { allowAbsolute?: boolean }): string | null {
-  const normalized = readNonEmptyString(inputPath)
-  if (!normalized || normalized.includes('\0')) return null
-
-  if (isAbsolute(normalized)) {
-    if (!options?.allowAbsolute) return null
-    const absoluteCandidate = resolve(normalized)
-    return isPathWithinBase(WORKSPACE_PATH, absoluteCandidate) ? absoluteCandidate : null
-  }
-
-  const candidate = resolve(WORKSPACE_PATH, normalized)
-  return isPathWithinBase(WORKSPACE_PATH, candidate) ? candidate : null
-}
-
-function toWorkspaceRelativePath(absolutePath: string): string {
-  return relative(WORKSPACE_PATH, absolutePath).replace(/\\/g, '/')
-}
-
 function inferAttachmentMimeType(sourcePath: string): string {
   const ext = extname(sourcePath).toLowerCase()
   const mimeByExt: Record<string, string> = {
@@ -1370,23 +1048,6 @@ function readNonEmptyString(value: unknown): string | undefined {
   if (typeof value !== 'string') return undefined
   const trimmed = value.trim()
   return trimmed.length > 0 ? trimmed : undefined
-}
-
-const ALLOWED_EXTERNAL_PROTOCOLS = new Set(['https:', 'http:', 'mailto:'])
-
-function sanitizeExternalUrl(value: unknown): string | null {
-  const text = readNonEmptyString(value)
-  if (!text) return null
-
-  try {
-    const parsed = new URL(text)
-    if (!ALLOWED_EXTERNAL_PROTOCOLS.has(parsed.protocol)) {
-      return null
-    }
-    return parsed.toString()
-  } catch {
-    return null
-  }
 }
 
 function normalizeRouteMessageInboundContext(value: unknown): TopicRouteInboundContext | undefined {
@@ -1658,12 +1319,17 @@ async function invokeGatewayTool(
 }
 
 export function registerIpcHandlers(mcpManager?: MCPManager): void {
+  ipcMain.handle('gateway:detect', async () => {
+    try {
+      return { ok: true, data: await detectGateway() }
+    } catch (error) {
+      return { ok: false, error: String(error) }
+    }
+  })
+
   ipcMain.handle('gateway:health', async () => {
     try {
-      return {
-        ok: true,
-        data: await runGatewayOpWithAutoRepair(() => gatewayHealth())
-      }
+      return { ok: true, data: await gatewayHealth() }
     } catch (error) {
       return { ok: false, error: String(error) }
     }
@@ -1671,10 +1337,7 @@ export function registerIpcHandlers(mcpManager?: MCPManager): void {
 
   ipcMain.handle('gateway:sessions', async () => {
     try {
-      return {
-        ok: true,
-        data: await runGatewayOpWithAutoRepair(() => getSessions())
-      }
+      return { ok: true, data: await getSessions() }
     } catch (error) {
       return { ok: false, error: String(error) }
     }
@@ -1682,10 +1345,7 @@ export function registerIpcHandlers(mcpManager?: MCPManager): void {
 
   ipcMain.handle('gateway:agents-list', async () => {
     try {
-      return {
-        ok: true,
-        data: await runGatewayOpWithAutoRepair(() => getAgentsList())
-      }
+      return { ok: true, data: await getAgentsList() }
     } catch (error) {
       return { ok: false, error: String(error) }
     }
@@ -1694,10 +1354,7 @@ export function registerIpcHandlers(mcpManager?: MCPManager): void {
   ipcMain.handle('gateway:session-history', async (_, sessionKey: string, limit?: number) => {
     try {
       const normalizedLimit = Math.min(Math.max(readPositiveInt(limit) ?? 50, 10), 5000)
-      return {
-        ok: true,
-        data: await runGatewayOpWithAutoRepair(() => getSessionHistory(sessionKey, normalizedLimit))
-      }
+      return { ok: true, data: await getSessionHistory(sessionKey, normalizedLimit) }
     } catch (error) {
       return { ok: false, error: String(error) }
     }
@@ -1997,45 +1654,6 @@ export function registerIpcHandlers(mcpManager?: MCPManager): void {
     }
   })
 
-  ipcMain.handle('gateway:legacy-homes', async () => {
-    try {
-      return {
-        ok: true,
-        data: {
-          managedHome: OPENCLAW_HOME_PATH,
-          homes: discoverLegacyOpenclawHomes()
-        }
-      }
-    } catch (error) {
-      return { ok: false, error: String(error) }
-    }
-  })
-
-  ipcMain.handle('gateway:cleanup-legacy-homes', async (_, homes?: string[]) => {
-    try {
-      const cleanup = cleanupLegacyOpenclawHomes(homes)
-      let repairOutput = ''
-      let repairOk = true
-
-      if (cleanup.removed.length > 0) {
-        const prepared = await prepareGatewayRuntime()
-        repairOk = prepared.ok
-        repairOutput = prepared.output || ''
-      }
-
-      return {
-        ok: true,
-        data: {
-          ...cleanup,
-          repairOk,
-          repairOutput
-        }
-      }
-    } catch (error) {
-      return { ok: false, error: String(error) }
-    }
-  })
-
   ipcMain.handle('gateway:update-config', async (_, config: Record<string, unknown>) => {
     try {
       // Transform shorthand keys to proper OpenClaw config paths
@@ -2085,30 +1703,7 @@ export function registerIpcHandlers(mcpManager?: MCPManager): void {
       const data = await restartGateway()
       return { ok: true, data }
     } catch (error) {
-      try {
-        const repairResult = await attemptGatewaySelfRepair(error)
-        if (repairResult.attempted && !repairResult.ok) {
-          return {
-            ok: false,
-            error: `${String(error)}\n\n${repairResult.output || 'Gateway self-repair failed.'}`
-          }
-        }
-
-        const shellRestartResult = await runShellCommand('openclaw gateway restart || openclaw gateway start', 60_000)
-        if (shellRestartResult.ok) {
-          return {
-            ok: true,
-            data: shellRestartResult.output || repairResult.output || 'Gateway restarted with shell fallback.'
-          }
-        }
-
-        return {
-          ok: false,
-          error: shellRestartResult.output || String(error)
-        }
-      } catch (fallbackError) {
-        return { ok: false, error: String(fallbackError) }
-      }
+      return { ok: false, error: String(error) }
     }
   })
 
@@ -2160,16 +1755,9 @@ export function registerIpcHandlers(mcpManager?: MCPManager): void {
   // Shell-based gateway start — works even when the gateway HTTP endpoint is down
   ipcMain.handle('gateway:start-shell', async () => {
     try {
-      const result = await runShellCommand('openclaw gateway restart', 60_000)
+      const result = await runShellCommand('openclaw gateway start || openclaw gateway restart', 60_000)
       if (!result.ok) {
-        const prepared = await prepareGatewayRuntime()
-        if (!prepared.ok) {
-          return {
-            ok: false,
-            error: `${result.output || 'Failed to start gateway'}\n\n${prepared.output || 'Gateway repair failed.'}`
-          }
-        }
-        return { ok: true, data: prepared.output || result.output }
+        return { ok: false, error: result.output || 'Failed to start gateway' }
       }
       return { ok: true, data: result.output }
     } catch (error) {
@@ -2255,9 +1843,7 @@ export function registerIpcHandlers(mcpManager?: MCPManager): void {
             return { ok: false, error: String(error) }
           }
         }
-        const data = await runGatewayOpWithAutoRepair(
-          () => invokeGatewayTool(tool, args ?? {}, sessionKey)
-        )
+        const data = await invokeGatewayTool(tool, args ?? {}, sessionKey)
         return { ok: true, data }
       } catch (error) {
         return { ok: false, error: String(error) }
@@ -2267,9 +1853,7 @@ export function registerIpcHandlers(mcpManager?: MCPManager): void {
 
   ipcMain.handle('gateway:tools-sessions-list', async (_, parameters?: Record<string, unknown>) => {
     try {
-      const data = await runGatewayOpWithAutoRepair(
-        () => invokeGatewayTool('sessions_list', parameters ?? {})
-      )
+      const data = await invokeGatewayTool('sessions_list', parameters ?? {})
       return { ok: true, data }
     } catch (error) {
       return { ok: false, error: String(error) }
@@ -2278,9 +1862,7 @@ export function registerIpcHandlers(mcpManager?: MCPManager): void {
 
   ipcMain.handle('gateway:tools-session-status', async (_, parameters?: Record<string, unknown>) => {
     try {
-      const data = await runGatewayOpWithAutoRepair(
-        () => invokeGatewayTool('session_status', parameters ?? {})
-      )
+      const data = await invokeGatewayTool('session_status', parameters ?? {})
       return { ok: true, data }
     } catch (error) {
       return { ok: false, error: String(error) }
@@ -2486,9 +2068,37 @@ export function registerIpcHandlers(mcpManager?: MCPManager): void {
     }
   })
 
+  ipcMain.handle('terminal:check-openclaw', async () => {
+    try {
+      const result = await runShellCommand('which openclaw || command -v openclaw', 15_000)
+      if (!result.ok) {
+        return {
+          ok: true,
+          data: {
+            installed: false,
+            path: null
+          }
+        }
+      }
+
+      const resolvedPath = result.output
+        .split('\n')
+        .map((line) => line.trim())
+        .find(Boolean) || null
+      return {
+        ok: true,
+        data: {
+          installed: Boolean(resolvedPath),
+          path: resolvedPath
+        }
+      }
+    } catch (error) {
+      return { ok: false, error: String(error) }
+    }
+  })
+
   ipcMain.handle('terminal:create', async (event) => {
     try {
-      enforcePermission('command_run', 'Create terminal session')
       const result = createTerminalSession(event.sender)
       if (!result.ok) {
         return { ok: false, error: result.error || 'Failed to create terminal session.' }
@@ -2501,7 +2111,6 @@ export function registerIpcHandlers(mcpManager?: MCPManager): void {
 
   ipcMain.handle('terminal:write', async (event, data: string) => {
     try {
-      enforcePermission('command_run', 'Run terminal command')
       const session = terminalSessions.get(event.sender.id)
       if (!session) {
         return { ok: false, error: 'No active terminal session.' }
@@ -2550,8 +2159,8 @@ export function registerIpcHandlers(mcpManager?: MCPManager): void {
     try {
       enforcePermission('file_read', `Read file: ${filename}`)
       activityLogger.log('file_read', `Read file: ${filename}`)
-      const filepath = resolveWorkspacePath(filename)
-      if (!filepath) {
+      const filepath = join(WORKSPACE_PATH, filename)
+      if (!filepath.startsWith(WORKSPACE_PATH)) {
         return { ok: false, error: 'Invalid file path' }
       }
       const content = readFileSync(filepath, 'utf-8')
@@ -2565,8 +2174,8 @@ export function registerIpcHandlers(mcpManager?: MCPManager): void {
     try {
       enforcePermission('file_read', `Read file: ${filename}`)
       activityLogger.log('file_read', `Read binary file: ${filename}`)
-      const filepath = resolveWorkspacePath(filename)
-      if (!filepath) {
+      const filepath = join(WORKSPACE_PATH, filename)
+      if (!filepath.startsWith(WORKSPACE_PATH)) {
         return { ok: false, error: 'Invalid file path' }
       }
       const buffer = readFileSync(filepath)
@@ -2587,8 +2196,8 @@ export function registerIpcHandlers(mcpManager?: MCPManager): void {
     try {
       enforcePermission('file_write', `Write file: ${filename}`)
       activityLogger.log('file_write', `Write file: ${filename}`)
-      const filepath = resolveWorkspacePath(filename)
-      if (!filepath) {
+      const filepath = join(WORKSPACE_PATH, filename)
+      if (!filepath.startsWith(WORKSPACE_PATH)) {
         return { ok: false, error: 'Invalid file path' }
       }
       const parentDir = dirname(filepath)
@@ -2606,8 +2215,8 @@ export function registerIpcHandlers(mcpManager?: MCPManager): void {
     try {
       enforcePermission('file_write', `Delete file: ${filename}`)
       activityLogger.log('file_write', `Delete file: ${filename}`)
-      const filepath = resolveWorkspacePath(filename)
-      if (!filepath) {
+      const filepath = join(WORKSPACE_PATH, filename)
+      if (!filepath.startsWith(WORKSPACE_PATH)) {
         return { ok: false, error: 'Invalid file path' }
       }
 
@@ -2659,8 +2268,8 @@ export function registerIpcHandlers(mcpManager?: MCPManager): void {
       })
 
       const destinationRelative = safeSegments.join('/')
-      const destinationPath = resolveWorkspacePath(destinationRelative)
-      if (!destinationPath) {
+      const destinationPath = join(WORKSPACE_PATH, destinationRelative)
+      if (!destinationPath.startsWith(WORKSPACE_PATH)) {
         return { ok: false, error: 'Invalid destination path' }
       }
 
@@ -2874,16 +2483,38 @@ export function registerIpcHandlers(mcpManager?: MCPManager): void {
     }
   )
 
-  // Onboarding: check if onboarding is complete
+  // Onboarding: check whether onboarding should be skipped
   ipcMain.handle('onboarding:check', async () => {
     try {
-      if (!existsSync(PINCHR_CONFIG_PATH)) {
-        return { ok: true, data: { completed: false } }
+      let pinchrConfig: Record<string, unknown> = {}
+      if (existsSync(PINCHR_CONFIG_PATH)) {
+        pinchrConfig = JSON.parse(readFileSync(PINCHR_CONFIG_PATH, 'utf-8')) as Record<string, unknown>
       }
-      const config = JSON.parse(readFileSync(PINCHR_CONFIG_PATH, 'utf-8'))
-      return { ok: true, data: { completed: config.onboardingCompleted || false } }
-    } catch (error) {
-      return { ok: true, data: { completed: false } }
+      const manualCompletion = pinchrConfig.onboardingCompleted === true
+      const gateway = await detectGateway()
+      const completed = gateway.status === 'connected' && (gateway.hasApiKey || manualCompletion)
+
+      return {
+        ok: true,
+        data: {
+          completed,
+          gateway
+        }
+      }
+    } catch {
+      return {
+        ok: true,
+        data: {
+          completed: false,
+          gateway: {
+            status: 'not-found',
+            url: 'http://127.0.0.1:18789',
+            token: null,
+            hasApiKey: false,
+            configExists: existsSync(OPENCLAW_CONFIG_PATH)
+          } satisfies GatewayDetection
+        }
+      }
     }
   })
 
@@ -2912,8 +2543,17 @@ export function registerIpcHandlers(mcpManager?: MCPManager): void {
   // Onboarding: check system readiness for in-app install flow
   ipcMain.handle('onboarding:system-check', async () => {
     try {
-      const versionResult = await runShellCommand('openclaw --version', 15000)
-      const cliInstalled = versionResult.ok
+      const nodeVersionResult = await runShellCommand('node --version', 10_000)
+      const nodeInstalled = nodeVersionResult.ok
+      const nodeVersion = nodeInstalled
+        ? (nodeVersionResult.output.split('\n').map((line) => line.trim()).find(Boolean) || null)
+        : null
+
+      const openclawPathResult = await runShellCommand('which openclaw || command -v openclaw', 10_000)
+      const cliInstalled = openclawPathResult.ok
+      const versionResult = cliInstalled
+        ? await runShellCommand('openclaw --version', 15_000)
+        : { ok: false, output: '', code: 127 as number | null }
       const cliVersion = cliInstalled
         ? (versionResult.output.split('\n').map((line) => line.trim()).find(Boolean) || null)
         : null
@@ -2924,17 +2564,14 @@ export function registerIpcHandlers(mcpManager?: MCPManager): void {
         gatewayStatus = statusResult.output || (statusResult.ok ? 'Gateway status checked.' : 'Gateway status unavailable.')
       }
 
-      let gatewayReachable = false
-      try {
-        await gatewayHealth()
-        gatewayReachable = true
-      } catch {
-        gatewayReachable = false
-      }
+      const detectedGateway = await detectGateway()
+      const gatewayReachable = detectedGateway.status === 'connected'
 
       return {
         ok: true,
         data: {
+          nodeInstalled,
+          nodeVersion,
           cliInstalled,
           cliVersion,
           gatewayReachable,
@@ -2959,51 +2596,90 @@ export function registerIpcHandlers(mcpManager?: MCPManager): void {
     return { ok: false, error: 'External terminal flow is disabled.' }
   })
 
-  ipcMain.handle('onboarding:write-initial-config', async () => {
+  ipcMain.handle('onboarding:run-install', async (event, command: string) => {
     try {
-      const result = await writeInitialOpenClawConfig()
-      if (!result.ok) {
-        return { ok: false, error: result.output || 'Failed to initialize OpenClaw config.' }
+      const senderId = event.sender.id
+      const normalizedCommand = command.trim() as OnboardingInstallCommand
+      if (!ALLOWED_ONBOARDING_INSTALL_COMMANDS.has(normalizedCommand)) {
+        return {
+          ok: false,
+          error: 'Command is not allowed for onboarding install.'
+        }
       }
+      if (onboardingInstallRuns.has(senderId)) {
+        return { ok: false, error: 'An onboarding install command is already running.' }
+      }
+
+      const runId = randomUUID()
+      const shellPath = resolveShell()
+      const shellArgs = process.platform === 'win32'
+        ? ['/d', '/s', '/c', normalizedCommand]
+        : [...resolveShellArgs(shellPath), '-c', normalizedCommand]
+      const child = spawn(shellPath, shellArgs, {
+        cwd: WORKSPACE_PATH,
+        env: shellEnv()
+      })
+
+      onboardingInstallRuns.set(senderId, { runId, process: child })
+
+      child.stdout.on('data', (chunk: Buffer) => {
+        sendOnboardingInstallEvent(senderId, 'onboarding:install-output', {
+          runId,
+          command: normalizedCommand,
+          stream: 'stdout',
+          chunk: chunk.toString('utf-8')
+        })
+      })
+
+      child.stderr.on('data', (chunk: Buffer) => {
+        sendOnboardingInstallEvent(senderId, 'onboarding:install-output', {
+          runId,
+          command: normalizedCommand,
+          stream: 'stderr',
+          chunk: chunk.toString('utf-8')
+        })
+      })
+
+      child.on('error', (error) => {
+        if (onboardingInstallRuns.get(senderId)?.runId !== runId) return
+        sendOnboardingInstallEvent(senderId, 'onboarding:install-output', {
+          runId,
+          command: normalizedCommand,
+          stream: 'stderr',
+          chunk: `${String(error)}\n`
+        })
+        sendOnboardingInstallEvent(senderId, 'onboarding:install-exit', {
+          runId,
+          command: normalizedCommand,
+          code: -1,
+          signal: null,
+          ok: false
+        })
+        closeOnboardingInstallRun(senderId, true)
+      })
+
+      child.on('close', (code, signal) => {
+        if (onboardingInstallRuns.get(senderId)?.runId !== runId) return
+        sendOnboardingInstallEvent(senderId, 'onboarding:install-exit', {
+          runId,
+          command: normalizedCommand,
+          code: typeof code === 'number' ? code : null,
+          signal: signal ?? null,
+          ok: code === 0
+        })
+        closeOnboardingInstallRun(senderId, true)
+      })
+
+      event.sender.once('destroyed', () => {
+        closeOnboardingInstallRun(senderId)
+      })
+
       return {
         ok: true,
         data: {
-          created: result.created,
-          output: result.output
+          runId
         }
       }
-    } catch (error) {
-      return { ok: false, error: String(error) }
-    }
-  })
-
-  // Onboarding: install/restart gateway and verify local connectivity
-  ipcMain.handle('onboarding:prepare-gateway', async () => {
-    try {
-      const prepared = await prepareGatewayRuntime()
-      if (!prepared.ok) {
-        return { ok: false, error: prepared.output }
-      }
-
-      return {
-        ok: true,
-        data: {
-          output: prepared.output
-        }
-      }
-    } catch (error) {
-      return { ok: false, error: String(error) }
-    }
-  })
-
-  // Gateway: repair service state and restart using bundled runtime
-  ipcMain.handle('gateway:repair-shell', async () => {
-    try {
-      const prepared = await prepareGatewayRuntime()
-      if (!prepared.ok) {
-        return { ok: false, error: prepared.output || 'Gateway repair failed.' }
-      }
-      return { ok: true, data: prepared.output || 'Gateway repaired and running.' }
     } catch (error) {
       return { ok: false, error: String(error) }
     }
@@ -3483,11 +3159,7 @@ export function registerIpcHandlers(mcpManager?: MCPManager): void {
   // Open external links (for markdown links)
   ipcMain.handle('shell:open-external', async (_, url: string) => {
     try {
-      const safeUrl = sanitizeExternalUrl(url)
-      if (!safeUrl) {
-        return { ok: false, error: 'Invalid URL' }
-      }
-      await shell.openExternal(safeUrl)
+      await shell.openExternal(url)
       return { ok: true }
     } catch (error) {
       return { ok: false, error: String(error) }
@@ -3501,8 +3173,8 @@ export function registerIpcHandlers(mcpManager?: MCPManager): void {
         return { ok: false, error: 'Path is required' }
       }
 
-      const resolvedPath = resolveWorkspacePath(normalizedPath, { allowAbsolute: true })
-      if (!resolvedPath) {
+      const resolvedPath = isAbsolute(normalizedPath) ? normalizedPath : join(WORKSPACE_PATH, normalizedPath)
+      if (!isAbsolute(normalizedPath) && !resolvedPath.startsWith(WORKSPACE_PATH)) {
         return { ok: false, error: 'Invalid file path' }
       }
 
@@ -3644,18 +3316,16 @@ export function registerIpcHandlers(mcpManager?: MCPManager): void {
           // Try unstaged first, then HEAD
           let diffStat = ''
           try {
-            diffStat = execFileSync(
-              'git',
-              ['diff', '--numstat', '--', filePath],
+            diffStat = execSync(
+              `git diff --numstat -- "${filePath}"`,
               { cwd: WORKSPACE_PATH, encoding: 'utf-8', timeout: 3000 }
             ).trim()
           } catch { /* ignore */ }
 
           if (!diffStat) {
             try {
-              diffStat = execFileSync(
-                'git',
-                ['diff', 'HEAD', '--numstat', '--', filePath],
+              diffStat = execSync(
+                `git diff HEAD --numstat -- "${filePath}"`,
                 { cwd: WORKSPACE_PATH, encoding: 'utf-8', timeout: 3000 }
               ).trim()
             } catch { /* ignore */ }
@@ -3687,7 +3357,7 @@ export function registerIpcHandlers(mcpManager?: MCPManager): void {
       // Check for deleted files via git
       const deletedFiles = new Set<string>()
       try {
-        const gitStatus = execFileSync('git', ['status', '--porcelain'], {
+        const gitStatus = execSync('git status --porcelain', {
           cwd: WORKSPACE_PATH, encoding: 'utf-8', timeout: 5000
         }).trim()
         if (gitStatus) {
@@ -3698,9 +3368,8 @@ export function registerIpcHandlers(mcpManager?: MCPManager): void {
               // Get last modify time from git log
               let lastModified = new Date().toISOString()
               try {
-                const logDate = execFileSync(
-                  'git',
-                  ['log', '-1', '--format=%ai', '--', filePath],
+                const logDate = execSync(
+                  `git log -1 --format="%ai" -- "${filePath}"`,
                   { cwd: WORKSPACE_PATH, encoding: 'utf-8', timeout: 3000 }
                 ).trim()
                 if (logDate) lastModified = new Date(logDate).toISOString()
@@ -3799,16 +3468,15 @@ export function registerIpcHandlers(mcpManager?: MCPManager): void {
   ipcMain.handle('security:file-diff', async (_, filePath: string) => {
     try {
       // Try git diff (unstaged changes) first, then git diff HEAD (staged + unstaged)
-      const fullPath = resolveWorkspacePath(filePath)
-      if (!fullPath) {
+      const fullPath = join(WORKSPACE_PATH, filePath)
+      if (!fullPath.startsWith(WORKSPACE_PATH)) {
         return { ok: false, error: 'Invalid file path' }
       }
-      const workspaceRelativePath = toWorkspaceRelativePath(fullPath)
 
       let diff = ''
       try {
         // Show unstaged changes
-        diff = execFileSync('git', ['diff', '--', workspaceRelativePath], {
+        diff = execSync(`git diff -- "${filePath}"`, {
           cwd: WORKSPACE_PATH,
           encoding: 'utf-8',
           timeout: 5000
@@ -3818,7 +3486,7 @@ export function registerIpcHandlers(mcpManager?: MCPManager): void {
       // If no unstaged diff, check if file is untracked (new file)
       if (!diff) {
         try {
-          const status = execFileSync('git', ['status', '--porcelain', '--', workspaceRelativePath], {
+          const status = execSync(`git status --porcelain -- "${filePath}"`, {
             cwd: WORKSPACE_PATH,
             encoding: 'utf-8',
             timeout: 5000
@@ -3831,11 +3499,11 @@ export function registerIpcHandlers(mcpManager?: MCPManager): void {
               .split('\n')
               .map((line) => `+ ${line}`)
               .join('\n')
-            diff = `--- /dev/null\n+++ b/${workspaceRelativePath}\n${diff}`
+            diff = `--- /dev/null\n+++ b/${filePath}\n${diff}`
           } else if (status) {
             // Has staged changes
             try {
-              diff = execFileSync('git', ['diff', 'HEAD', '--', workspaceRelativePath], {
+              diff = execSync(`git diff HEAD -- "${filePath}"`, {
                 cwd: WORKSPACE_PATH,
                 encoding: 'utf-8',
                 timeout: 5000
@@ -3848,9 +3516,8 @@ export function registerIpcHandlers(mcpManager?: MCPManager): void {
       // Also get recent git log for the file
       let history: Array<{ hash: string; date: string; message: string }> = []
       try {
-        const log = execFileSync(
-          'git',
-          ['log', '--pretty=format:%h|%ai|%s', '-10', '--', workspaceRelativePath],
+        const log = execSync(
+          `git log --pretty=format:"%h|%ai|%s" -10 -- "${filePath}"`,
           { cwd: WORKSPACE_PATH, encoding: 'utf-8', timeout: 5000 }
         ).trim()
         if (log) {

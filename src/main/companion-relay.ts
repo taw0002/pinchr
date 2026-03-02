@@ -1,15 +1,13 @@
 import { createHash } from 'crypto'
-import { existsSync, mkdirSync, readFileSync, unlinkSync, writeFileSync } from 'fs'
+import { existsSync, mkdirSync, readFileSync, writeFileSync } from 'fs'
 import { homedir, hostname, platform, arch, userInfo } from 'os'
 import { join } from 'path'
-import { safeStorage } from 'electron'
 import { createClient, type RealtimeChannel, type SupabaseClient } from '@supabase/supabase-js'
 import { activityLogger } from './activity-log'
 import { gatewayHealth, getGatewayConfig, getGatewayUrl, getGatewayToken, getHeaders, getSessionHistory, getSessions, restartGateway, sendMessage, updateConfig } from './gateway'
 import { routeMessageToTopicSession, type TopicRouteInboundContext } from './topic-router'
 
 const PINCHR_CONFIG_PATH = join(homedir(), '.pinchr', 'config.json')
-const RELAY_SECRETS_PATH = join(homedir(), '.pinchr', 'companion-relay.enc')
 const DEFAULT_API_BASE_URL = 'https://pinchr.app'
 const DEFAULT_SUPABASE_URL = 'https://oawvyhggbmqekrtivvli.supabase.co'
 const DEFAULT_SUPABASE_ANON_KEY = process.env.PINCHR_SUPABASE_ANON_KEY
@@ -112,58 +110,6 @@ function writeConfigFile(config: PinchrConfig): void {
   writeFileSync(PINCHR_CONFIG_PATH, JSON.stringify(config, null, 2))
 }
 
-function readRelaySecrets(): { relayKey?: string; authToken?: string } {
-  try {
-    if (!existsSync(RELAY_SECRETS_PATH) || !safeStorage.isEncryptionAvailable()) {
-      return {}
-    }
-
-    const encrypted = readFileSync(RELAY_SECRETS_PATH)
-    const decrypted = safeStorage.decryptString(encrypted)
-    const parsed = JSON.parse(decrypted) as Record<string, unknown>
-    return {
-      relayKey: typeof parsed.relayKey === 'string' ? parsed.relayKey : undefined,
-      authToken: typeof parsed.authToken === 'string' ? parsed.authToken : undefined
-    }
-  } catch {
-    return {}
-  }
-}
-
-function writeRelaySecrets(secrets: { relayKey?: string; authToken?: string }): boolean {
-  const relayKey = typeof secrets.relayKey === 'string' && secrets.relayKey.trim()
-    ? secrets.relayKey
-    : undefined
-  const authToken = typeof secrets.authToken === 'string' && secrets.authToken.trim()
-    ? secrets.authToken
-    : undefined
-
-  if (!relayKey && !authToken) {
-    try {
-      if (existsSync(RELAY_SECRETS_PATH)) {
-        unlinkSync(RELAY_SECRETS_PATH)
-      }
-    } catch {
-      // Best-effort cleanup only.
-    }
-    return true
-  }
-
-  if (!safeStorage.isEncryptionAvailable()) return false
-
-  try {
-    const encrypted = safeStorage.encryptString(JSON.stringify({ relayKey, authToken }))
-    const configDir = join(homedir(), '.pinchr')
-    if (!existsSync(configDir)) {
-      mkdirSync(configDir, { recursive: true })
-    }
-    writeFileSync(RELAY_SECRETS_PATH, encrypted)
-    return true
-  } catch {
-    return false
-  }
-}
-
 function sanitizeApiBaseUrl(input: unknown): string {
   if (typeof input !== 'string') return DEFAULT_API_BASE_URL
   const trimmed = input.trim()
@@ -182,25 +128,6 @@ function sanitizePollIntervalMs(input: unknown): number {
 function loadRelayConfig(): CompanionRelayConfig {
   const root = readConfigFile()
   const relay = root.companionRelay || {}
-  const plaintextRelayKey = typeof relay.relayKey === 'string' ? relay.relayKey : undefined
-  const plaintextAuthToken = typeof relay.authToken === 'string' ? relay.authToken : undefined
-  const encryptedSecrets = readRelaySecrets()
-
-  // One-time migration from plaintext config secrets to encrypted storage.
-  if ((plaintextRelayKey || plaintextAuthToken) && !encryptedSecrets.relayKey && !encryptedSecrets.authToken) {
-    const migrated = writeRelaySecrets({
-      relayKey: plaintextRelayKey,
-      authToken: plaintextAuthToken
-    })
-    if (migrated) {
-      const updatedRoot = readConfigFile()
-      const updatedRelay = (updatedRoot.companionRelay || {}) as Partial<CompanionRelayConfig>
-      delete updatedRelay.relayKey
-      delete updatedRelay.authToken
-      updatedRoot.companionRelay = updatedRelay
-      writeConfigFile(updatedRoot)
-    }
-  }
 
   return {
     enabled: relay.enabled !== false,
@@ -212,19 +139,14 @@ function loadRelayConfig(): CompanionRelayConfig {
     pollIntervalMs: sanitizePollIntervalMs(relay.pollIntervalMs),
     allowHighRiskRemoteActions: relay.allowHighRiskRemoteActions === true,
     desktopId: typeof relay.desktopId === 'string' ? relay.desktopId : undefined,
-    relayKey: encryptedSecrets.relayKey ?? plaintextRelayKey,
+    relayKey: typeof relay.relayKey === 'string' ? relay.relayKey : undefined,
     desktopName: typeof relay.desktopName === 'string' ? relay.desktopName : undefined,
-    authToken: encryptedSecrets.authToken ?? plaintextAuthToken
+    authToken: typeof relay.authToken === 'string' ? relay.authToken : undefined
   }
 }
 
 function saveRelayConfig(config: CompanionRelayConfig): void {
   const root = readConfigFile()
-  const wroteSecrets = writeRelaySecrets({
-    relayKey: config.relayKey,
-    authToken: config.authToken
-  })
-
   root.companionRelay = {
     enabled: config.enabled,
     apiBaseUrl: config.apiBaseUrl,
@@ -233,13 +155,9 @@ function saveRelayConfig(config: CompanionRelayConfig): void {
     pollIntervalMs: config.pollIntervalMs,
     allowHighRiskRemoteActions: config.allowHighRiskRemoteActions,
     desktopId: config.desktopId,
+    relayKey: config.relayKey,
     desktopName: config.desktopName,
-    ...(wroteSecrets
-      ? {}
-      : {
-          relayKey: config.relayKey,
-          authToken: config.authToken
-        })
+    authToken: config.authToken
   }
   writeConfigFile(root)
 }

@@ -495,7 +495,7 @@ export class MCPManager {
     await Promise.allSettled(ids.map((id) => this.disconnectServer(id)))
   }
 
-  private normalizeServerConfig(input: Record<string, unknown> | MCPServerConfig): MCPServerConfig {
+  private normalizeServerConfig(input: MCPServerConfig): MCPServerConfig {
     const transport = input.transport === 'sse' ? 'sse' : 'stdio'
     const env: Record<string, string> = {}
     for (const [key, value] of Object.entries(input.env ?? {})) {
@@ -527,7 +527,7 @@ export class MCPManager {
       return parsed
         .map((entry) => {
           if (!isRecord(entry)) return null
-          return this.normalizeServerConfig(entry)
+          return this.normalizeServerConfig(entry as MCPServerConfig)
         })
         .filter((entry): entry is MCPServerConfig => Boolean(entry))
     } catch {

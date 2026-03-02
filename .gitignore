@@ -1,17 +1,7 @@
 node_modules/
 dist/
 out/
-.next/
 .env
-.env.*
-*.pem
-*.key
-*.p12
-*.dmg
 .DS_Store
 *.log
 test-screenshots/
-.idea/
-.vscode/
-*.tsbuildinfo
-deploy.sh

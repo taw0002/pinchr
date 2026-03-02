@@ -214,7 +214,7 @@ export function Sidebar({ currentPage, onNavigate, onReportIssue }: SidebarProps
                 <p className="text-[10px] text-text-muted">OpenClaw version</p>
                 <p className="text-[10px] font-mono text-text-secondary">{displayOpenclawVersion}</p>
               </div>
-              <p className="text-[10px] text-text-muted">OpenClaw is bundled with Pinchr updates.</p>
+              <p className="text-[10px] text-text-muted">OpenClaw runs separately and Pinchr connects over localhost.</p>
             </div>
           )}
         </div>

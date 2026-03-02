@@ -10,6 +10,14 @@ export interface GatewayHealth {
   version?: string
 }
 
+export interface GatewayDetection {
+  status: 'connected' | 'not-found'
+  url: string
+  token: string | null
+  hasApiKey: boolean
+  configExists: boolean
+}
+
 export interface Session {
   key: string
   status: string
@@ -38,7 +46,7 @@ export interface Message {
   role: 'user' | 'assistant' | 'system'
   content: string
   parts?: MessageContentPart[]
-  timestamp?: string
+  timestamp?: string | number
   channel?: string
   isStreaming?: boolean
   isThinking?: boolean
@@ -540,9 +548,30 @@ export interface User {
   email: string
   name: string
   avatarUrl?: string | null
-  tier: string
+  tier: 'free' | 'basic' | 'pro'
   trialEndsAt?: string | null
   stripeCustomerId?: string | null
+}
+
+export type OnboardingInstallCommand =
+  | 'npm i -g openclaw'
+  | 'openclaw gateway install'
+  | 'openclaw gateway start'
+  | 'openclaw setup'
+
+export interface OnboardingInstallOutputEvent {
+  runId: string
+  command: OnboardingInstallCommand
+  stream: 'stdout' | 'stderr'
+  chunk: string
+}
+
+export interface OnboardingInstallExitEvent {
+  runId: string
+  command: OnboardingInstallCommand
+  code: number | null
+  signal: string | null
+  ok: boolean
 }
 
 export interface ElectronAPI {
@@ -551,6 +580,7 @@ export interface ElectronAPI {
   downloadUpdate: () => Promise<IpcResult<{ started: boolean; downloaded?: boolean; version?: string; source?: 'electron-updater' | 'manual' }>>
   restartToUpdate: () => Promise<IpcResult<void>>
   gateway: {
+    detect: () => Promise<IpcResult<GatewayDetection>>
     health: () => Promise<IpcResult<GatewayHealth>>
     getSessions: () => Promise<IpcResult<Session[]>>
     getAgentsList: () => Promise<IpcResult<Array<{ id: string; name?: string; configured?: boolean }>>>
@@ -572,18 +602,8 @@ export interface ElectronAPI {
     onStreamChunk: (streamId: string, callback: (data: StreamChunk) => void) => () => void // Returns cleanup function
     onStreamError: (streamId: string, callback: (data: any) => void) => () => void // Returns cleanup function
     getConfig: () => Promise<IpcResult<GatewayConfig>>
-    getLegacyHomes: () => Promise<IpcResult<{ managedHome: string; homes: string[] }>>
-    cleanupLegacyHomes: (homes?: string[]) => Promise<IpcResult<{
-      managedHome: string
-      archived: Array<{ source: string; archive: string }>
-      removed: string[]
-      skipped: Array<{ home: string; reason: string }>
-      repairOk: boolean
-      repairOutput: string
-    }>>
     updateConfig: (config: Record<string, unknown>) => Promise<IpcResult<GatewayConfig>>
     restart: () => Promise<IpcResult<string>>
-    repairShell: () => Promise<IpcResult<string>>
     startShell: () => Promise<IpcResult<string>>
     getSessionStatus: () => Promise<IpcResult<SessionStatusParsed>>
     toolsInvoke: (tool: string, args?: Record<string, unknown>, sessionKey?: string) => Promise<IpcResult<unknown>>
@@ -639,7 +659,10 @@ export interface ElectronAPI {
     ) => Promise<IpcResult<string>>
   }
   onboarding: {
-    check: () => Promise<IpcResult<{ completed: boolean }>>
+    check: () => Promise<IpcResult<{
+      completed: boolean
+      gateway: GatewayDetection
+    }>>
     complete: () => Promise<IpcResult<void>>
     saveApiKey: (provider: string, apiKey: string) => Promise<IpcResult<void>>
     saveChannelConfig: (channel: string, config: Record<string, unknown>) => Promise<IpcResult<void>>
@@ -647,15 +670,19 @@ export interface ElectronAPI {
     checkTool: (toolName: string) => Promise<IpcResult<{ ok: boolean; version: string | null }>>
     installSkill: (skillName: string) => Promise<IpcResult<{ output: string }>>
     systemCheck: () => Promise<IpcResult<{
+      nodeInstalled: boolean
+      nodeVersion: string | null
       cliInstalled: boolean
       cliVersion: string | null
       gatewayReachable: boolean
       gatewayStatus: string | null
     }>>
-    writeInitialConfig: () => Promise<IpcResult<{ created: boolean; output: string }>>
-    prepareGateway: () => Promise<IpcResult<{ output: string }>>
+    runInstall: (command: OnboardingInstallCommand) => Promise<IpcResult<{ runId: string }>>
+    onInstallOutput: (callback: (event: OnboardingInstallOutputEvent) => void) => () => void
+    onInstallExit: (callback: (event: OnboardingInstallExitEvent) => void) => () => void
   }
   terminal: {
+    checkOpenclaw: () => Promise<IpcResult<{ installed: boolean; path: string | null }>>
     create: () => Promise<IpcResult<void>>
     write: (data: string) => Promise<IpcResult<void>>
     resize: (cols: number, rows: number) => Promise<IpcResult<void>>
@@ -687,8 +714,8 @@ export interface ElectronAPI {
     onNavigate: (callback: (route: string) => void) => () => void
   }
   license: {
-    status: () => Promise<IpcResult<{ valid: boolean; plan: 'free' }>>
-    activate: (key: string) => Promise<IpcResult<{ valid: boolean; plan: 'free' }>>
+    status: () => Promise<IpcResult<{ valid: boolean; plan: 'free' | 'basic' | 'pro'; expiresAt?: string; trialEndsAt?: string; isTrialActive?: boolean }>>
+    activate: (key: string) => Promise<IpcResult<{ valid: boolean; plan: 'free' | 'basic' | 'pro' }>>
     deactivate: () => Promise<IpcResult<void>>
   }
   security: {

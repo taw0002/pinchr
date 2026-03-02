@@ -329,6 +329,114 @@ function headers(): Record<string, string> {
   return h
 }
 
+function parseJsonText(text: string): unknown | null {
+  const trimmed = text.trim()
+  if (!trimmed) return null
+
+  const candidates: string[] = [trimmed]
+  const fencedMatch = trimmed.match(/```(?:json)?\s*([\s\S]*?)\s*```/i)
+  if (fencedMatch?.[1]) {
+    candidates.push(fencedMatch[1].trim())
+  }
+
+  for (const candidate of candidates) {
+    try {
+      return JSON.parse(candidate) as unknown
+    } catch {
+      // Try the next candidate.
+    }
+  }
+
+  return null
+}
+
+function extractTextFromToolContent(content: unknown): string | null {
+  if (typeof content === 'string') return readString(content)
+
+  if (Array.isArray(content)) {
+    for (const entry of content) {
+      if (typeof entry === 'string') {
+        const text = readString(entry)
+        if (text) return text
+        continue
+      }
+
+      const entryRecord = asRecord(entry)
+      if (!entryRecord) continue
+      const text = readString(entryRecord.text) ?? readString(entryRecord.content)
+      if (text) return text
+    }
+    return null
+  }
+
+  const contentRecord = asRecord(content)
+  return readString(contentRecord?.text) ?? readString(contentRecord?.content)
+}
+
+function looksLikeGatewayConfig(value: unknown): value is Record<string, unknown> {
+  const record = asRecord(value)
+  if (!record) return false
+
+  return Boolean(
+    asRecord(record.channels) ||
+    asRecord(record.plugins) ||
+    asRecord(record.gateway) ||
+    asRecord(record.agents) ||
+    asRecord(record.models)
+  )
+}
+
+function extractGatewayConfigPayload(value: unknown): Record<string, unknown> | null {
+  const queue: unknown[] = [value]
+  const seen = new Set<object>()
+
+  while (queue.length > 0) {
+    const current = queue.shift()
+    if (current === undefined || current === null) continue
+
+    if (typeof current === 'string') {
+      const parsed = parseJsonText(current)
+      if (parsed !== null) queue.push(parsed)
+      continue
+    }
+
+    if (Array.isArray(current)) {
+      queue.push(...current)
+      continue
+    }
+
+    const record = asRecord(current)
+    if (!record) continue
+    if (seen.has(record)) continue
+    seen.add(record)
+
+    if (looksLikeGatewayConfig(record)) return record
+
+    const nestedKeys = ['result', 'data', 'parsed', 'config', 'snapshot', 'value', 'payload', 'details']
+    for (const key of nestedKeys) {
+      if (Object.prototype.hasOwnProperty.call(record, key)) {
+        queue.push(record[key])
+      }
+    }
+
+    if (Object.prototype.hasOwnProperty.call(record, 'content')) {
+      queue.push(record.content)
+    }
+  }
+
+  return null
+}
+
+function readGatewayConfigFromDisk(): Record<string, unknown> | null {
+  try {
+    if (!existsSync(CONFIG_PATH)) return null
+    return asRecord(JSON.parse(readFileSync(CONFIG_PATH, 'utf-8')))
+  } catch (error) {
+    console.warn('[gateway] Failed to read local OpenClaw config:', error)
+    return null
+  }
+}
+
 async function toolsInvoke(tool: string, args: Record<string, unknown> = {}): Promise<unknown> {
   const res = await fetch(`${getGatewayUrl()}/tools/invoke`, {
     method: 'POST',
@@ -339,25 +447,19 @@ async function toolsInvoke(tool: string, args: Record<string, unknown> = {}): Pr
     const text = await res.text()
     throw new Error(`tools/invoke ${tool} failed (${res.status}): ${text.slice(0, 200)}`)
   }
-  const json = await res.json() as {
-    ok?: boolean;
-    result?: {
-      content?: Array<{ type: string; text: string }>;
-      details?: Record<string, unknown>;
-    }
-  }
-  // Extract the text content from the tool result
-  const textContent = json?.result?.content?.find((c) => c.type === 'text')?.text
+  const json = await res.json() as unknown
+  const root = asRecord(json)
+  const result = asRecord(root?.result)
+  const textContent = extractTextFromToolContent(result?.content ?? root?.content)
   if (textContent) {
-    // Try to parse as JSON (sessions_list, sessions_history return JSON strings)
-    try {
-      return JSON.parse(textContent)
-    } catch {
-      // Not JSON — return details if available, otherwise the text
-      return json?.result?.details ?? textContent
-    }
+    const parsed = parseJsonText(textContent)
+    if (parsed !== null) return parsed
+    return result?.details ?? textContent
   }
-  return json?.result?.details ?? json
+
+  if (result?.details !== undefined) return result.details
+  if (root?.result !== undefined) return root.result
+  return root ?? json
 }
 
 export async function gatewayHealth(): Promise<unknown> {
@@ -447,7 +549,9 @@ function getSessionHistoryFromDisk(sessionKey: string, limit = 50): Array<{ role
 
         if (content.trim() === '' && !parts.some((part) => part.type === 'image_url')) continue
 
-        messages.push({ role, content, parts })
+        // Preserve timestamp from the message object or the JSONL entry
+        const timestamp = msg.timestamp ?? entry.timestamp
+        messages.push({ role, content, parts, ...(timestamp != null ? { timestamp } : {}) })
       } catch {
         // Skip malformed lines
       }
@@ -476,6 +580,7 @@ export async function getSessionHistory(sessionKey: string, limit = 50): Promise
   }
 
   // Preserve multimodal content for the renderer while also exposing flattened text.
+  // Normalize timestamps from multiple possible field names (OpenClaw uses 'at', 'createdAt', etc.)
   return messages
     .map((msg) => {
       const parts = normalizeMessageParts(msg.content)
@@ -484,7 +589,9 @@ export async function getSessionHistory(sessionKey: string, limit = 50): Promise
         .map((part) => part.text)
         .join('\n')
 
-      return { ...msg, content, parts }
+      const raw = msg as Record<string, unknown>
+      const timestamp = raw.timestamp ?? raw.at ?? raw.createdAt ?? raw.created_at
+      return { ...msg, content, parts, ...(timestamp != null ? { timestamp } : {}) }
     })
     .filter((msg) => msg.content.trim() !== '' || msg.parts.some((part: MessageContentPart) => part.type === 'image_url'))
 }
@@ -795,16 +902,16 @@ function normalizeMessageParts(content: unknown): MessageContentPart[] {
 }
 
 export async function getGatewayConfig(): Promise<unknown> {
-  // Use tools/invoke to get config via the gateway API
   try {
-    const raw = await toolsInvoke('gateway', { action: 'config.get' }) as Record<string, unknown>
-    const result = (raw?.result ?? raw?.data ?? raw) as Record<string, unknown>
-    const config = result?.parsed ?? result?.config ?? result
-    return config
+    const raw = await toolsInvoke('gateway', { action: 'config.get' })
+    const parsed = extractGatewayConfigPayload(raw)
+    if (parsed) return parsed
+    console.warn('[gateway] Unable to parse config.get response shape; using local OpenClaw config fallback')
   } catch (error) {
-    console.error('Failed to get gateway config:', error)
-    return null
+    console.warn('[gateway] Failed to fetch config via gateway tool; using local OpenClaw config fallback:', error)
   }
+
+  return readGatewayConfigFromDisk()
 }
 
 export async function updateConfig(patch: Record<string, unknown>): Promise<unknown> {

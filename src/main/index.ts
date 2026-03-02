@@ -34,17 +34,6 @@ let tray: Tray | null = null
 let quickMessageWindow: BrowserWindow | null = null
 let workspaceFileWatcher: WorkspaceFileWatcher | null = null
 const mcpManager = new MCPManager()
-let isQuitting = false
-
-function openExternalIfSafe(rawUrl: string): void {
-  try {
-    const parsed = new URL(rawUrl)
-    if (!['https:', 'http:', 'mailto:'].includes(parsed.protocol)) return
-    void shell.openExternal(parsed.toString())
-  } catch {
-    // Ignore malformed or unsupported URLs.
-  }
-}
 
 function saveWindowState(window: BrowserWindow): void {
   try {
@@ -104,7 +93,7 @@ function createQuickMessageWindow(): BrowserWindow {
     backgroundColor: '#0a0a0a',
     webPreferences: {
       preload: join(__dirname, '../preload/index.js'),
-      sandbox: true,
+      sandbox: false,
       contextIsolation: true,
       nodeIntegration: false
     }
@@ -302,7 +291,7 @@ function createWindow(): BrowserWindow {
     backgroundColor: '#0a0a0a',
     webPreferences: {
       preload: join(__dirname, '../preload/index.js'),
-      sandbox: true,
+      sandbox: false,
       contextIsolation: true,
       nodeIntegration: false
     }
@@ -324,7 +313,7 @@ function createWindow(): BrowserWindow {
 
   // Handle close to hide to tray instead of quit
   newWindow.on('close', (event) => {
-    if (!isQuitting) {
+    if (!app.isQuitting) {
       event.preventDefault()
       hideMainWindow()
       return false
@@ -332,7 +321,7 @@ function createWindow(): BrowserWindow {
   })
 
   newWindow.webContents.setWindowOpenHandler((details) => {
-    openExternalIfSafe(details.url)
+    shell.openExternal(details.url)
     return { action: 'deny' }
   })
 
@@ -486,7 +475,7 @@ app.whenReady().then(() => {
   })
 
   app.on('before-quit', async () => {
-    isQuitting = true
+    app.isQuitting = true
     if (mainWindow && !mainWindow.isDestroyed()) {
       saveWindowState(mainWindow)
     }

@@ -19,7 +19,7 @@ if [ -z "${AWS_SECRET_ACCESS_KEY:-}" ]; then
   LAUNCHPAD_ENV="${LAUNCHPAD_ENV:-$HOME/Downloads/Development/launchpad/.env}"
   if [ -f "$LAUNCHPAD_ENV" ]; then
     export AWS_SECRET_ACCESS_KEY=$(grep AWS_SECRET_ACCESS_KEY "$LAUNCHPAD_ENV" | cut -d= -f2)
-    export AWS_ACCESS_KEY_ID=$(grep AWS_ACCESS_KEY_ID "$LAUNCHPAD_ENV" | cut -d= -f2)
+    export AWS_ACCESS_KEY_ID="${AWS_ACCESS_KEY_ID:-AKIAXEQKF4VLHTWTJ2OZ}"
   fi
 fi
 
